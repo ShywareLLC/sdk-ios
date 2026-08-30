@@ -14,10 +14,10 @@ Also ships `DPIAHelpers`, the Swift proof/evidence helper target used by Stack 5
 Add to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/NickCarducci/Shyware-SDK.git", from: "0.1.0")
+.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.1.0")
 ```
 
-Or in Xcode: **File → Add Packages**, enter `https://github.com/NickCarducci/Shyware-SDK.git`.
+Or in Xcode: **File → Add Packages**, enter `https://github.com/ShywareLLC/sdk-ios.git`.
 
 Then add the target dependency:
 
