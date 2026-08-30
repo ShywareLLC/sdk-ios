@@ -3,6 +3,8 @@
 Swift Package for the iOS Shyware client SDK.  
 Platforms: macOS 13+, iOS 16+ · Swift 5.9+
 
+Also ships `DPIAHelpers`, the Swift proof/evidence helper target used by Stack 5 DPIA suites.
+
 ---
 
 ## Installation
@@ -21,6 +23,12 @@ Then add the target dependency:
 
 ```swift
 .product(name: "ShywareSDK", package: "ShywareSDK")
+```
+
+For DPIA proof/evidence suites, add:
+
+```swift
+.product(name: "DPIAHelpers", package: "ShywareSDK")
 ```
 
 ### Local (monorepo)

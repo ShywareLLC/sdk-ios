@@ -10,11 +10,17 @@ let package = Package(
     ],
     products: [
         .library(name: "ShywareSDK", targets: ["ShywareSDK"]),
+        .library(name: "DPIAHelpers", targets: ["DPIAHelpers"]),
     ],
     targets: [
         .target(
             name: "ShywareSDK",
             path: "Sources/ShywareSDK"
+        ),
+        .target(
+            name: "DPIAHelpers",
+            path: "Sources/DPIAHelpers",
+            exclude: ["dpia_test_helpers.kt"]
         ),
         .testTarget(
             name: "ShywareSDKTests",
