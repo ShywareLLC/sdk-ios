@@ -1,29 +1,25 @@
 // swift-tools-version: 5.9
-// Shyware SDK — Swift package exposing DPIAHelpers for Stack 5 DPIA consumer tests
+// Shyware SDK — Swift/iOS client
 import PackageDescription
 
 let package = Package(
-    name: "web",
-    platforms: [.macOS(.v13)],
-    products: [
-        .library(name: "DPIAHelpers", targets: ["DPIAHelpers"]),
+    name: "ShywareSDK",
+    platforms: [
+        .iOS(.v17),
+        .macOS(.v14),
     ],
-    dependencies: [
-        .package(path: "../ios"),
+    products: [
+        .library(name: "ShywareSDK", targets: ["ShywareSDK"]),
     ],
     targets: [
         .target(
-            name: "DPIAHelpers",
-            path: "Sources/DPIAHelpers"
+            name: "ShywareSDK",
+            path: "Sources/ShywareSDK"
         ),
-        // SDK protocol invariant suite — no consumer dependency, no network
         .testTarget(
-            name: "DPIASdkProtocol",
-            dependencies: [
-                "DPIAHelpers",
-                .product(name: "ShywareSDK", package: "ios"),
-            ],
-            path: "tests/swift"
+            name: "ShywareSDKTests",
+            dependencies: ["ShywareSDK"],
+            path: "Tests/ShywareSDKTests"
         ),
     ]
 )
