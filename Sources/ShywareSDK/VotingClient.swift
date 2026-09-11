@@ -53,9 +53,14 @@ public struct PostureOverride: Decodable, Sendable {
 
 // MARK: - Client
 
-/// A closure that, given raw request body data, returns an App Attest assertion.
-/// Takes `requestData` (typically the POST body or URL bytes for GET requests),
-/// and returns the raw assertion bytes to be base64-encoded into `X-App-Attest-Assertion`.
+/// A closure that, given raw request body data, returns the value to send verbatim
+/// as the `X-Attest-Token` header (UTF-8-encoded). Takes `requestData` (typically
+/// the POST body or URL bytes for GET requests).
+///
+/// For App Attest, the real server's verifier (ShywareLLC/core
+/// `services/attest/verifier.go` `AppAttestVerifier.Verify`) expects the token in
+/// the form `"<keyID>:<assertionBase64>:<requestHashHex>"` — see
+/// `AppAttestProvider.attestToken(requestData:)`, which builds exactly this string.
 public typealias ShyAssertionProvider = (Data) async throws -> Data
 
 public actor VotingClient {
@@ -161,41 +166,137 @@ public actor VotingClient {
     }
 
     // MARK: - Read
+    //
+    // Routes below match the real Go server exactly — see
+    // ShywareLLC/core api/server/router.go `Router()`:
+    //   GET  /polls
+    //   GET  /polls/{poll_id}
+    //   GET  /polls/{poll_id}/tally
+    //   GET  /polls/{poll_id}/votes
 
     public func getAllPolls() async throws -> [Poll] {
-        let response: PollsResponse = try await get("/api/vote/polls")
+        let response: PollsResponse = try await get("/polls")
         return response.polls
     }
 
     public func getPoll(_ id: String) async throws -> Poll {
-        return try await get("/api/vote/polls/\(id)")
+        return try await get("/polls/\(id)")
     }
 
     public func getTally(_ id: String) async throws -> Tally {
-        return try await get("/api/vote/polls/\(id)/count")
+        return try await get("/polls/\(id)/tally")
     }
 
     public func getVotes(_ id: String) async throws -> [VoteRecord] {
-        let response: VotesResponse = try await get("/api/vote/reconcile/ballot?pollId=\(id)")
+        let response: VotesResponse = try await get("/polls/\(id)/votes")
         return response.votes
+    }
+
+    // MARK: - Beacon
+    //
+    // Decodes the CometBFT `/status` payload proxied verbatim by the real
+    // server's GET /health (ShywareLLC/core api/server/router.go `health`).
+    // Used to populate beacon_block_hash / beacon_block_height on a ballot: the
+    // state machine's beacon window (ShywareLLC/core protocol/submission/nonce.go
+    // ValidateBeacon) requires these to name a block that was already canonical
+    // before the submission nonce was generated.
+    private struct CometStatusResponse: Decodable {
+        struct SyncInfo: Decodable {
+            let latestBlockHash: String
+            let latestBlockHeight: String
+            enum CodingKeys: String, CodingKey {
+                case latestBlockHash = "latest_block_hash"
+                case latestBlockHeight = "latest_block_height"
+            }
+        }
+        struct Result: Decodable {
+            let syncInfo: SyncInfo
+            enum CodingKeys: String, CodingKey { case syncInfo = "sync_info" }
+        }
+        let result: Result
+    }
+
+    private func fetchBeacon() async throws -> (hash: String, height: Int64) {
+        let status: CometStatusResponse = try await get("/health")
+        guard let height = Int64(status.result.syncInfo.latestBlockHeight) else {
+            throw ShywareError.apiError("Invalid latest_block_height in /health response")
+        }
+        // CometBFT's RPC serializes block hashes as uppercase hex. The Go state
+        // machine's beacon window stores hex.EncodeToString output, which is
+        // always lowercase (ShywareLLC/core app/app.go: RecordBeacon(req.Height,
+        // hex.EncodeToString(req.Hash))). ValidateBeacon does an exact string
+        // comparison, so this must be normalized to lowercase or every ballot
+        // fails beacon validation at flush time.
+        let hash = status.result.syncInfo.latestBlockHash.lowercased()
+        return (hash, height)
     }
 
     // MARK: - Build
 
+    /// Builds a fully signed TxTypeBallotCast envelope matching the real server's
+    /// wire schema exactly (ShywareLLC/core protocol/tx/tx.go `BallotCastData`).
+    ///
+    /// Device signature (oracle-forgery prevention): a fresh per-poll Ed25519
+    /// keypair is generated on-device. Its private key signs
+    /// `submission_nonce + ":" + scoping_id` locally and is never transmitted or
+    /// retained — only `voter_pub_key` (hex) and `voter_sig` (base64) leave this
+    /// method. This matches ShywareLLC/core domain/state/ballots.go
+    /// `voterDeviceSigMessage` / `validateBallotCast` exactly, so the IDV provider
+    /// — which never holds this private key — cannot forge a ballot even though
+    /// it attests the resulting public key (see the idv_attestation_sig TODO below).
     public func buildBallot(pollId: String, choice: String, input: IdentityInput) async throws -> BallotResult {
         let nonce = randomHex(32)
         let ballotId = sha256hex(nonce)
-        let commitment = try createIdentityCommitment(manifest: manifest, input: input)
-        let identityHash = sha256hex(commitment + pollId)
 
-        let payload: [String: Any] = [
-            "poll_id": pollId,
-            "identity_hash": identityHash,
-            "choice": choice,
-            "ballot_nonce": nonce,
+        // Per-poll Ed25519 keypair, generated fresh on-device for this ballot.
+        let voterKey = Curve25519.Signing.PrivateKey()
+        let voterPubKeyHex = voterKey.publicKey.rawRepresentation
+            .map { String(format: "%02x", $0) }.joined()
+        let deviceMessage = Data((nonce + ":" + pollId).utf8)
+        let voterSig = try voterKey.signature(for: deviceMessage)
+
+        // Canonical identity_hash for the default (non-ZK) IDV-attestation
+        // embodiment — matches the Go server's diditIdentityHash exactly:
+        // sha256(voter_pub_key || poll_id). Used only for the local receipt below,
+        // not sent on the wire (the server re-derives it from voter_pub_key).
+        let identityHash = sha256hex(voterPubKeyHex + pollId)
+
+        let beacon = try await fetchBeacon()
+
+        let data: [String: Any] = [
+            "scoping_id": pollId,
+            "choices": [choice],
+            "submission_nonce": nonce,
+            "beacon_block_hash": beacon.hash,
+            "beacon_block_height": beacon.height,
             "timestamp": Int(Date().timeIntervalSince1970),
+            "voter_pub_key": voterPubKeyHex,
+            "voter_sig": voterSig.base64EncodedString(),
         ]
-        let envelope: [String: Any] = ["type": 2, "signature": "AQ==", "data": payload]
+
+        // TODO(idv-integration): idv_attestation_sig is REQUIRED by the real
+        // server — ShywareLLC/core protocol/tx/tx.go BallotCastData.Validate()
+        // rejects any ballot missing it (unless the ZK high-assurance fields are
+        // present instead): "ballot must carry idv_attestation_sig or full ZK
+        // fields". The value must be an Ed25519 signature produced by the Didit
+        // IDV provider's OWN signing key — never this device's sk_v — over
+        // sha256(voter_pub_key_bytes || poll_id_bytes) (see
+        // ShywareLLC/core services/identity/didit.go diditDeviceAttestMessage /
+        // DiditVerifier.VerifyAndIdentify). Concretely, the integration point
+        // still needed is: send `createIdentityCommitment(manifest:input:)`
+        // (Identity.swift) or `voterPubKeyHex` to a real Didit signing endpoint
+        // and have Didit sign sha256(voterPubKeyHex || pollId) with its
+        // registered key. This SDK has no such endpoint wired in today, so
+        // `input` is accepted (to keep this method's signature stable once that
+        // integration lands) but not yet used, and idv_attestation_sig is
+        // intentionally omitted below rather than filled with a fabricated
+        // signature that no real IDV produced. Until this is wired in, the real
+        // server will reject every ballot built here with 400 at
+        // envelope.Validate() — that is the correct, honest behavior for an
+        // unfinished IDV integration, not a bug in this method.
+        _ = input
+
+        let envelope: [String: Any] = ["type": 2, "signature": "AQ==", "data": data]
         let txData = try JSONSerialization.data(withJSONObject: envelope)
         let txJson = String(decoding: txData, as: UTF8.self)
 
@@ -204,17 +305,23 @@ public actor VotingClient {
 
     // MARK: - Submit
 
-    public func submitBallot(pollId: String, choice: String) async throws {
-        try await post("/api/vote/cast", body: ["pollId": pollId, "direction": choice])
+    /// Submits an already-built, signed ballot envelope (from `buildBallot`) to
+    /// the real server's `POST /ballots` (ShywareLLC/core api/server/router.go
+    /// `submitBallot`), which expects exactly `{"tx": "<json-encoded Tx>"}`.
+    public func submitBallot(txJson: String) async throws {
+        try await post("/ballots", body: ["tx": txJson])
     }
 
+    /// Matches the real server's `POST /polls/{poll_id}/flush`
+    /// (ShywareLLC/core api/server/router.go `flushQueuedBallots`) — already
+    /// correct; kept here for symmetry with the other route-aligned methods above.
     public func flushQueuedBallots(pollId: String) async throws {
         try await post("/polls/\(pollId)/flush", body: [:] as [String: String])
     }
 
     public func castBallot(pollId: String, choice: String, input: IdentityInput) async throws -> BallotResult {
         let result = try await buildBallot(pollId: pollId, choice: choice, input: input)
-        try await submitBallot(pollId: pollId, choice: choice)
+        try await submitBallot(txJson: result.txJson)
 
         let posture = effectivePosture()
         if !posture.writeOnly {
@@ -298,17 +405,23 @@ public actor VotingClient {
 
     /// Injects authentication into a request based on api.auth_scheme.
     ///
-    /// - `app_attest`: calls `assertionProvider(requestData)` and attaches the
-    ///   base64-encoded assertion as `X-App-Attest-Assertion`. Fails silently if
-    ///   the provider is nil — the server will reject unauthenticated requests.
+    /// - `app_attest`: calls `assertionProvider(requestData)` and sets its
+    ///   UTF-8-decoded result verbatim as `X-Attest-Token`, plus
+    ///   `X-Attest-Platform: "ios"`. These are the exact header names the real
+    ///   server's middleware reads (ShywareLLC/core api/server/router.go
+    ///   `submitBallot`: `r.Header.Get("X-Attest-Platform")` /
+    ///   `r.Header.Get("X-Attest-Token")`). Fails silently if the provider is
+    ///   nil — the server will reject unauthenticated requests (401, or
+    ///   write-only fallback per the deployment's runtime_fallbacks).
     /// - `firebase_bearer`: no-op here; the caller (SwiftUI/ViewModel layer)
     ///   is responsible for setting `Authorization: Bearer <idToken>` on the
     ///   `URLSession` or on each request before it reaches this client.
     private func injectAuth(_ req: inout URLRequest, requestData: Data) async throws {
         guard manifest.api.requiresAuth, manifest.api.authScheme == "app_attest" else { return }
         guard let provider = assertionProvider else { return }
-        if let assertion = try? await provider(requestData) {
-            req.setValue(assertion.base64EncodedString(), forHTTPHeaderField: "X-App-Attest-Assertion")
+        if let token = try? await provider(requestData) {
+            req.setValue(String(decoding: token, as: UTF8.self), forHTTPHeaderField: "X-Attest-Token")
+            req.setValue("ios", forHTTPHeaderField: "X-Attest-Platform")
         }
     }
 

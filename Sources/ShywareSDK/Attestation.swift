@@ -144,6 +144,32 @@ public class AppAttestProvider {
         return try await dcService.generateAssertion(id, clientDataHash: hash)
     }
 
+    /// Builds the full `X-Attest-Token` value expected by the real Shyware Go
+    /// server's `AppAttestVerifier` (ShywareLLC/core `services/attest/verifier.go`):
+    ///
+    ///     "<keyID>:<assertionBase64>:<requestHashHex>"
+    ///
+    /// The server reconstructs `clientDataHash = SHA256(requestHashHex bytes)`
+    /// and verifies the assertion signature over
+    /// `SHA256(authenticatorData || clientDataHash)`. To produce a signature the
+    /// server can verify, the device must call `generateAssertion` with that same
+    /// `clientDataHash` — NOT a direct hash of `requestData` — which is why this
+    /// hashes twice (once to get `requestHashHex`, once again over its UTF-8
+    /// bytes to get the actual `clientDataHash` passed to Apple's API).
+    ///
+    /// Returns UTF-8-encoded token bytes, matching `ShyAssertionProvider`'s
+    /// contract in VotingClient.swift.
+    public func attestToken(requestData: Data) async throws -> Data {
+        guard let id = keyId else {
+            throw ShywareError.invalidInput("No attested App Attest key — call attestKey() first.")
+        }
+        let requestHashHex = SHA256.hash(data: requestData).map { String(format: "%02x", $0) }.joined()
+        let clientDataHash = Data(SHA256.hash(data: Data(requestHashHex.utf8)))
+        let assertion = try await dcService.generateAssertion(id, clientDataHash: clientDataHash)
+        let token = "\(id):\(assertion.base64EncodedString()):\(requestHashHex)"
+        return Data(token.utf8)
+    }
+
     /// Generate an assertion covering a `URLRequest` (method + URL + body).
     /// Matches the hash strategy used by Populist's AppAttestService.
     public func assert(for request: URLRequest) async throws -> Data {
@@ -158,12 +184,17 @@ public class AppAttestProvider {
 
     /// Returns a `ShyAssertionProvider` closure wrapping this provider.
     /// Pass to `VotingClient.from(_:assertionProvider:)`.
+    ///
+    /// Returns the composed `X-Attest-Token` value (see `attestToken(requestData:)`
+    /// above) — VotingClient sets it verbatim as the `X-Attest-Token` header
+    /// alongside `X-Attest-Platform: "ios"`, matching the real server's
+    /// `AppAttestVerifier` exactly.
     public func assertionProvider() -> ShyAssertionProvider {
         return { [weak self] requestData in
             guard let self else {
                 throw ShywareError.invalidInput("AppAttestProvider deallocated.")
             }
-            return try await self.assert(requestData: requestData)
+            return try await self.attestToken(requestData: requestData)
         }
     }
 
