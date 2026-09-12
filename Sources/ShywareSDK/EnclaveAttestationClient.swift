@@ -74,21 +74,33 @@ public enum EnclaveAttestationError: Error, LocalizedError {
 /// other request the SDK makes (e.g. `VotingClient`'s own `URLSession.shared`
 /// use for the real relay/API is untouched).
 public actor EnclaveAttestationClient {
-    /// Production enclave endpoint (OCI AMD SEV-SNP confidential-computing
-    /// instance). Overridable for testing.
-    public static let defaultBaseURL = "https://129.213.45.125:8443"
-
     private let baseURL: String
     private let session: URLSession
 
-    public init(baseURL: String = EnclaveAttestationClient.defaultBaseURL) {
+    /// No default `baseURL` is provided deliberately: this SDK is shared
+    /// across every Shyware voting-type consumer, and each deployment runs
+    /// its own independent attestation service (its own enclave, its own
+    /// trust boundary) -- hardcoding one deployment's endpoint here would
+    /// silently route every other consumer's traffic through it. Read
+    /// `identity.attestation_service_base_url` (and, if present,
+    /// `identity.attestation_service_tls_pin_sha256_base64`) from this
+    /// deployment's own shyconfig and pass them in explicitly.
+    ///
+    /// - Parameters:
+    ///   - baseURL: this deployment's own attestation-service base URL.
+    ///   - pinnedHost: host to apply certificate pinning to (typically the
+    ///     host component of `baseURL`). Pass `nil` to skip pinning (e.g.
+    ///     once the service has a CA-issued certificate).
+    ///   - pinnedSPKISHA256Base64: Base64(SHA-256(SubjectPublicKeyInfo DER))
+    ///     of the service's current certificate, required if `pinnedHost`
+    ///     is non-nil.
+    public init(baseURL: String, pinnedHost: String? = nil, pinnedSPKISHA256Base64: String? = nil) {
         self.baseURL = baseURL
         let config = URLSessionConfiguration.ephemeral
-        self.session = URLSession(
-            configuration: config,
-            delegate: EnclaveCertificatePinningDelegate(),
-            delegateQueue: nil
-        )
+        let delegate: URLSessionDelegate? = pinnedHost.map { host in
+            EnclaveCertificatePinningDelegate(pinnedHost: host, pinnedSPKISHA256Base64: pinnedSPKISHA256Base64 ?? "")
+        }
+        self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
     }
 
     /// Requests an IDV attestation signature for `voterPubKeyHex` over `pollId`,
@@ -126,33 +138,36 @@ public actor EnclaveAttestationClient {
     }
 }
 
-/// Pins TLS connections to `129.213.45.125` (the enclave host) to the exact
-/// public key of the enclave's current self-signed certificate, identified by
-/// SHA-256(SubjectPublicKeyInfo). This is real certificate/public-key
-/// pinning — not a blanket "trust everything" override — and is scoped to
-/// exactly this host via `URLSessionDelegate`, which is only ever attached to
+/// Pins TLS connections to one configured host to the exact public key of
+/// that deployment's own attestation service's current self-signed
+/// certificate, identified by SHA-256(SubjectPublicKeyInfo). This is real
+/// certificate/public-key pinning — not a blanket "trust everything"
+/// override — and is scoped to exactly the host it's constructed with, via
+/// `URLSessionDelegate`, which is only ever attached to
 /// `EnclaveAttestationClient`'s own dedicated `URLSession`.
 ///
-/// The pin below was captured directly from the deployed enclave
-/// (`openssl s_client -connect 129.213.45.125:8443 | openssl x509 -pubkey`)
-/// and verified against SHA-256(SubjectPublicKeyInfo DER) — reproduced on iOS
-/// via `SecKeyCopyExternalRepresentation`, which returns the PKCS#1 raw RSA
-/// key for RSA keys, prefixed here with the standard ASN.1 SPKI header for
-/// 2048-bit RSA keys (the well-known TrustKit-style header) before hashing,
-/// since `SecKeyCopyExternalRepresentation` does not include it.
+/// Both the host and the pin are supplied by the caller (sourced from that
+/// deployment's own shyconfig — see `EnclaveAttestationClient.init`) rather
+/// than hardcoded here, since this SDK is shared across every Shyware
+/// voting-type consumer and each one runs its own independent service.
 ///
-/// Rotation: if the enclave's certificate is ever reissued (e.g. after a
-/// redeploy that regenerates its self-signed cert), this pin must be updated
-/// or every request to the enclave will fail closed (by design — failing
-/// closed on a pin mismatch is the whole point of pinning).
+/// Rotation: if the service's certificate is ever reissued (e.g. after a
+/// redeploy that regenerates its self-signed cert), the deployment's
+/// configured pin must be updated or every request will fail closed (by
+/// design — failing closed on a pin mismatch is the whole point of pinning).
 final class EnclaveCertificatePinningDelegate: NSObject, URLSessionDelegate {
     /// Only this host gets pinned/self-signed-cert handling. Any other host
     /// falls through to normal system trust evaluation.
-    static let pinnedHost = "129.213.45.125"
+    let pinnedHost: String
 
-    /// Base64(SHA-256(SubjectPublicKeyInfo DER)) of the enclave's current
-    /// RSA-2048 public key, captured 2026-09-12 from the live deployment.
-    static let pinnedSPKISHA256Base64 = "XrWSSn+9TE9HU3uS53Hc+exspbJKah5KDnhnHCOYaCk="
+    /// Base64(SHA-256(SubjectPublicKeyInfo DER)) of this deployment's
+    /// attestation service's current RSA-2048 public key.
+    let pinnedSPKISHA256Base64: String
+
+    init(pinnedHost: String, pinnedSPKISHA256Base64: String) {
+        self.pinnedHost = pinnedHost
+        self.pinnedSPKISHA256Base64 = pinnedSPKISHA256Base64
+    }
 
     /// Standard SPKI ASN.1 header for a 2048-bit RSA public key (rsaEncryption
     /// OID + BIT STRING wrapper), prepended to the raw PKCS#1 key bytes that
@@ -175,17 +190,18 @@ final class EnclaveCertificatePinningDelegate: NSObject, URLSessionDelegate {
             return
         }
 
-        guard challenge.protectionSpace.host == Self.pinnedHost else {
-            // Not the enclave — defer to normal system trust evaluation.
-            // (This delegate is only ever attached to EnclaveAttestationClient's
-            // own URLSession, so in practice this host is always pinnedHost,
-            // but the guard keeps the intent explicit and safe if that changes.)
+        guard challenge.protectionSpace.host == pinnedHost else {
+            // Not this deployment's attestation service — defer to normal
+            // system trust evaluation. (This delegate is only ever attached
+            // to EnclaveAttestationClient's own URLSession, so in practice
+            // this host is always pinnedHost, but the guard keeps the intent
+            // explicit and safe if that changes.)
             completionHandler(.performDefaultHandling, nil)
             return
         }
 
         guard let leafKeyData = Self.leafPublicKeyData(from: serverTrust),
-              Self.spkiSHA256Base64(rsaPublicKeyDER: leafKeyData) == Self.pinnedSPKISHA256Base64
+              Self.spkiSHA256Base64(rsaPublicKeyDER: leafKeyData) == pinnedSPKISHA256Base64
         else {
             completionHandler(.cancelAuthenticationChallenge, nil)
             return

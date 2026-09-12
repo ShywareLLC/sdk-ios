@@ -169,6 +169,12 @@ public struct IdentityConfig: Codable, Sendable {
     public let recommendedIdv: String?
     public let kycRequired: Bool
     public let byoidPolicy: String?
+    /// This deployment's own independent IDV attestation service (e.g. a
+    /// confidential-computing enclave standing in for an IDV vendor that
+    /// cannot itself produce a signature). Deployment-specific — never a
+    /// shared/default value. See `EnclaveAttestationClient`.
+    public let attestationServiceBaseURL: String?
+    public let attestationServiceTLSPinSHA256Base64: String?
     enum CodingKeys: String, CodingKey {
         case provider, mode
         case issuerDid = "issuer_did"
@@ -176,12 +182,17 @@ public struct IdentityConfig: Codable, Sendable {
         case recommendedIdv = "recommended_idv"
         case kycRequired = "kyc_required"
         case byoidPolicy = "byoid_policy"
+        case attestationServiceBaseURL = "attestation_service_base_url"
+        case attestationServiceTLSPinSHA256Base64 = "attestation_service_tls_pin_sha256_base64"
     }
     public init(provider: String, mode: String, issuerDid: String? = nil, workflowId: String? = nil,
-                recommendedIdv: String? = nil, kycRequired: Bool = false, byoidPolicy: String? = nil) {
+                recommendedIdv: String? = nil, kycRequired: Bool = false, byoidPolicy: String? = nil,
+                attestationServiceBaseURL: String? = nil, attestationServiceTLSPinSHA256Base64: String? = nil) {
         self.provider = provider; self.mode = mode; self.issuerDid = issuerDid
         self.workflowId = workflowId; self.recommendedIdv = recommendedIdv
         self.kycRequired = kycRequired; self.byoidPolicy = byoidPolicy
+        self.attestationServiceBaseURL = attestationServiceBaseURL
+        self.attestationServiceTLSPinSHA256Base64 = attestationServiceTLSPinSHA256Base64
     }
 }
 

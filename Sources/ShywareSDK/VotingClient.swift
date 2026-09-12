@@ -69,7 +69,7 @@ public actor VotingClient {
     private let receiptStore: KeychainReceiptStore
     private let session: URLSession
     private let assertionProvider: ShyAssertionProvider?
-    private let enclaveClient: EnclaveAttestationClient
+    private let enclaveClient: EnclaveAttestationClient?
 
     /// Operator-pushed posture. Fetched from `deployment.posture_endpoint` on init.
     /// Wins over user preference, runtime fallbacks, and manifest default.
@@ -98,7 +98,21 @@ public actor VotingClient {
         self.receiptStore = KeychainReceiptStore(appId: manifest.app.id)
         self.session = URLSession.shared
         self.assertionProvider = assertionProvider
-        self.enclaveClient = EnclaveAttestationClient()
+        // Deployment-specific: each Shyware consumer configures its own
+        // attestation-service endpoint in its own shyconfig. `enclaveClient`
+        // is nil (and buildBallot's Didit-attestation path is unavailable)
+        // for deployments that haven't configured one, rather than silently
+        // falling back to any hardcoded default.
+        if let baseURL = manifest.identity.attestationServiceBaseURL {
+            let pinnedHost = URL(string: baseURL)?.host
+            self.enclaveClient = EnclaveAttestationClient(
+                baseURL: baseURL,
+                pinnedHost: pinnedHost,
+                pinnedSPKISHA256Base64: manifest.identity.attestationServiceTLSPinSHA256Base64
+            )
+        } else {
+            self.enclaveClient = nil
+        }
     }
 
     // MARK: - Posture
@@ -297,6 +311,11 @@ public actor VotingClient {
         // the enclave, not this device, is the party attesting the keypair.
         _ = input
         if let diditSessionId, !diditSessionId.isEmpty {
+            guard let enclaveClient else {
+                throw ShywareError.invalidManifest(
+                    "identity.attestation_service_base_url is not configured, but a Didit session_id was provided to buildBallot"
+                )
+            }
             let sigBytes = try await enclaveClient.attest(
                 sessionId: diditSessionId,
                 voterPubKeyHex: voterPubKeyHex,
