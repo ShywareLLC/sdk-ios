@@ -69,6 +69,7 @@ public actor VotingClient {
     private let receiptStore: KeychainReceiptStore
     private let session: URLSession
     private let assertionProvider: ShyAssertionProvider?
+    private let enclaveClient: EnclaveAttestationClient
 
     /// Operator-pushed posture. Fetched from `deployment.posture_endpoint` on init.
     /// Wins over user preference, runtime fallbacks, and manifest default.
@@ -97,6 +98,7 @@ public actor VotingClient {
         self.receiptStore = KeychainReceiptStore(appId: manifest.app.id)
         self.session = URLSession.shared
         self.assertionProvider = assertionProvider
+        self.enclaveClient = EnclaveAttestationClient()
     }
 
     // MARK: - Posture
@@ -244,7 +246,12 @@ public actor VotingClient {
     /// `voterDeviceSigMessage` / `validateBallotCast` exactly, so the IDV provider
     /// — which never holds this private key — cannot forge a ballot even though
     /// it attests the resulting public key (see the idv_attestation_sig TODO below).
-    public func buildBallot(pollId: String, choice: String, input: IdentityInput) async throws -> BallotResult {
+    public func buildBallot(
+        pollId: String,
+        choice: String,
+        input: IdentityInput,
+        diditSessionId: String? = nil
+    ) async throws -> BallotResult {
         let nonce = randomHex(32)
         let ballotId = sha256hex(nonce)
 
@@ -263,7 +270,7 @@ public actor VotingClient {
 
         let beacon = try await fetchBeacon()
 
-        let data: [String: Any] = [
+        var data: [String: Any] = [
             "scoping_id": pollId,
             "choices": [choice],
             "submission_nonce": nonce,
@@ -274,27 +281,30 @@ public actor VotingClient {
             "voter_sig": voterSig.base64EncodedString(),
         ]
 
-        // TODO(idv-integration): idv_attestation_sig is REQUIRED by the real
-        // server — ShywareLLC/core protocol/tx/tx.go BallotCastData.Validate()
-        // rejects any ballot missing it (unless the ZK high-assurance fields are
-        // present instead): "ballot must carry idv_attestation_sig or full ZK
-        // fields". The value must be an Ed25519 signature produced by the Didit
-        // IDV provider's OWN signing key — never this device's sk_v — over
-        // sha256(voter_pub_key_bytes || poll_id_bytes) (see
-        // ShywareLLC/core services/identity/didit.go diditDeviceAttestMessage /
-        // DiditVerifier.VerifyAndIdentify). Concretely, the integration point
-        // still needed is: send `createIdentityCommitment(manifest:input:)`
-        // (Identity.swift) or `voterPubKeyHex` to a real Didit signing endpoint
-        // and have Didit sign sha256(voterPubKeyHex || pollId) with its
-        // registered key. This SDK has no such endpoint wired in today, so
-        // `input` is accepted (to keep this method's signature stable once that
-        // integration lands) but not yet used, and idv_attestation_sig is
-        // intentionally omitted below rather than filled with a fabricated
-        // signature that no real IDV produced. Until this is wired in, the real
-        // server will reject every ballot built here with 400 at
-        // envelope.Validate() — that is the correct, honest behavior for an
-        // unfinished IDV integration, not a bug in this method.
+        // idv_attestation_sig: obtained from the IDV attestation enclave, an
+        // independent OCI AMD SEV-SNP confidential-computing service that holds
+        // its own Ed25519 signing keypair (never held by this app, the backend,
+        // or any operator) and independently re-verifies the Didit session
+        // against Didit's real session-status API before signing — see
+        // EnclaveAttestationClient. `diditSessionId` must be the Didit
+        // verification session_id backing this voter_pub_key; ShywareLLC/core's
+        // domain/state/ballots.go rejects reuse of the same session_id across
+        // any poll or voter_pub_key (on-chain, authoritative — see
+        // State.consumedSessions), so a fresh registration always requires a
+        // fresh (unconsumed) session.
+        //
+        // `input` is accepted for interface stability but not otherwise used —
+        // the enclave, not this device, is the party attesting the keypair.
         _ = input
+        if let diditSessionId, !diditSessionId.isEmpty {
+            let sigBytes = try await enclaveClient.attest(
+                sessionId: diditSessionId,
+                voterPubKeyHex: voterPubKeyHex,
+                pollId: pollId
+            )
+            data["idv_attestation_sig"] = sigBytes.base64EncodedString()
+            data["didit_session_id"] = diditSessionId
+        }
 
         let envelope: [String: Any] = ["type": 2, "signature": "AQ==", "data": data]
         let txData = try JSONSerialization.data(withJSONObject: envelope)
@@ -319,8 +329,13 @@ public actor VotingClient {
         try await post("/polls/\(pollId)/flush", body: [:] as [String: String])
     }
 
-    public func castBallot(pollId: String, choice: String, input: IdentityInput) async throws -> BallotResult {
-        let result = try await buildBallot(pollId: pollId, choice: choice, input: input)
+    public func castBallot(
+        pollId: String,
+        choice: String,
+        input: IdentityInput,
+        diditSessionId: String? = nil
+    ) async throws -> BallotResult {
+        let result = try await buildBallot(pollId: pollId, choice: choice, input: input, diditSessionId: diditSessionId)
         try await submitBallot(txJson: result.txJson)
 
         let posture = effectivePosture()
