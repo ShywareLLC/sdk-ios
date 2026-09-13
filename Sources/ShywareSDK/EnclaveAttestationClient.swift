@@ -138,9 +138,10 @@ public actor EnclaveAttestationClient {
     }
 }
 
-/// Pins TLS connections to one configured host to the exact public key of
-/// that deployment's own attestation service's current self-signed
-/// certificate, identified by SHA-256(SubjectPublicKeyInfo). This is real
+/// Pins TLS connections to one configured host to the public key of one
+/// certificate somewhere in that host's presented chain, identified by
+/// SHA-256(SubjectPublicKeyInfo) — checked against every certificate in the
+/// chain (`chainContainsPinnedKey`), not just the leaf. This is real
 /// certificate/public-key pinning — not a blanket "trust everything"
 /// override — and is scoped to exactly the host it's constructed with, via
 /// `URLSessionDelegate`, which is only ever attached to
@@ -151,17 +152,31 @@ public actor EnclaveAttestationClient {
 /// than hardcoded here, since this SDK is shared across every Shyware
 /// voting-type consumer and each one runs its own independent service.
 ///
-/// Rotation: if the service's certificate is ever reissued (e.g. after a
-/// redeploy that regenerates its self-signed cert), the deployment's
-/// configured pin must be updated or every request will fail closed (by
-/// design — failing closed on a pin mismatch is the whole point of pinning).
+/// Which certificate gets pinned is a deployment choice, not fixed by this
+/// code: pinning the attestation service's own leaf certificate directly
+/// (its original self-signed cert, or a Cloudflare-issued leaf) is the
+/// tightest pin but breaks on every renewal; pinning an intermediate CA
+/// certificate instead survives leaf rotation (e.g. Cloudflare's routine
+/// ~90-day Universal SSL renewal) at the cost of trusting that CA's
+/// intermediate generally, not just this one service.
+///
+/// Rotation: whichever certificate is pinned, if it's ever reissued with a
+/// new key, the deployment's configured pin must be updated or every
+/// request will fail closed (by design — failing closed on a pin mismatch
+/// is the whole point of pinning).
 final class EnclaveCertificatePinningDelegate: NSObject, URLSessionDelegate {
     /// Only this host gets pinned/self-signed-cert handling. Any other host
     /// falls through to normal system trust evaluation.
     let pinnedHost: String
 
-    /// Base64(SHA-256(SubjectPublicKeyInfo DER)) of this deployment's
-    /// attestation service's current RSA-2048 public key.
+    /// Base64(SHA-256(SubjectPublicKeyInfo DER)) of the pinned certificate in
+    /// this deployment's attestation-service chain. Originally this was
+    /// always the service's own self-signed leaf (RSA-2048). As of the
+    /// Cloudflare-fronted deployment this may instead be an intermediate CA
+    /// certificate's key (EC P-256, e.g. Google Trust Services' WE1) chosen
+    /// specifically because it rotates far less often than Cloudflare's
+    /// leaf certs -- see `matchingCertificateData` below, which checks
+    /// every certificate in the chain against this pin, not just the leaf.
     let pinnedSPKISHA256Base64: String
 
     init(pinnedHost: String, pinnedSPKISHA256Base64: String) {
@@ -172,10 +187,23 @@ final class EnclaveCertificatePinningDelegate: NSObject, URLSessionDelegate {
     /// Standard SPKI ASN.1 header for a 2048-bit RSA public key (rsaEncryption
     /// OID + BIT STRING wrapper), prepended to the raw PKCS#1 key bytes that
     /// `SecKeyCopyExternalRepresentation` returns for RSA keys, to reconstruct
-    /// the full SubjectPublicKeyInfo DER before hashing.
+    /// the full SubjectPublicKeyInfo DER before hashing. Matches the
+    /// attestation enclave's own original self-signed cert.
     private static let rsa2048SPKIHeader: [UInt8] = [
         0x30, 0x82, 0x01, 0x22, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
         0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0f, 0x00,
+    ]
+
+    /// Standard SPKI ASN.1 header for an EC P-256 (prime256v1/secp256r1)
+    /// public key (id-ecPublicKey + prime256v1 OIDs + BIT STRING wrapper),
+    /// prepended to the raw 65-byte uncompressed point (0x04 || X || Y) that
+    /// `SecKeyCopyExternalRepresentation` returns for P-256 keys. Needed
+    /// because Cloudflare's Universal SSL certificates (and the Google
+    /// Trust Services intermediates that issue them) are EC P-256, not RSA.
+    private static let ecdsaSecp256r1SPKIHeader: [UInt8] = [
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+        0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
+        0x42, 0x00,
     ]
 
     func urlSession(
@@ -200,9 +228,7 @@ final class EnclaveCertificatePinningDelegate: NSObject, URLSessionDelegate {
             return
         }
 
-        guard let leafKeyData = Self.leafPublicKeyData(from: serverTrust),
-              Self.spkiSHA256Base64(rsaPublicKeyDER: leafKeyData) == pinnedSPKISHA256Base64
-        else {
+        guard Self.chainContainsPinnedKey(serverTrust, pin: pinnedSPKISHA256Base64) else {
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
@@ -210,17 +236,53 @@ final class EnclaveCertificatePinningDelegate: NSObject, URLSessionDelegate {
         completionHandler(.useCredential, URLCredential(trust: serverTrust))
     }
 
-    private static func leafPublicKeyData(from trust: SecTrust) -> Data? {
-        guard let certificate = (SecTrustCopyCertificateChain(trust) as? [SecCertificate])?.first,
-              let publicKey = SecCertificateCopyKey(certificate),
-              let externalRepresentation = SecKeyCopyExternalRepresentation(publicKey, nil) as Data?
-        else { return nil }
-        return externalRepresentation
+    /// Checks every certificate in the presented chain (leaf through root)
+    /// against the pin, not just the leaf -- required to support pinning an
+    /// intermediate CA certificate instead of the frequently-rotated leaf.
+    private static func chainContainsPinnedKey(_ trust: SecTrust, pin: String) -> Bool {
+        guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate] else { return false }
+        for certificate in chain {
+            guard let publicKey = SecCertificateCopyKey(certificate),
+                  let externalRepresentation = SecKeyCopyExternalRepresentation(publicKey, nil) as Data?,
+                  let attributes = SecKeyCopyAttributes(publicKey) as? [CFString: Any],
+                  let keyType = attributes[kSecAttrKeyType] as? String,
+                  let keySizeInBits = attributes[kSecAttrKeySizeInBits] as? Int
+            else { continue }
+
+            guard let spkiHash = spkiSHA256Base64(
+                rawPublicKeyRepresentation: externalRepresentation,
+                keyType: keyType,
+                keySizeInBits: keySizeInBits
+            ) else { continue }
+
+            if spkiHash == pin { return true }
+        }
+        return false
     }
 
-    private static func spkiSHA256Base64(rsaPublicKeyDER pkcs1: Data) -> String {
-        var full = Data(rsa2048SPKIHeader)
-        full.append(pkcs1)
+    /// Reconstructs the full SubjectPublicKeyInfo DER from the raw key
+    /// representation `SecKeyCopyExternalRepresentation` returns (which
+    /// omits the AlgorithmIdentifier header, so it must be re-added before
+    /// hashing) and returns Base64(SHA-256(SPKI DER)). Returns nil for any
+    /// key type/size this pinning implementation doesn't recognize, rather
+    /// than guessing -- an unrecognized combination should fail the pin
+    /// check, not silently produce a hash that can never match anything.
+    private static func spkiSHA256Base64(
+        rawPublicKeyRepresentation: Data,
+        keyType: String,
+        keySizeInBits: Int
+    ) -> String? {
+        let header: [UInt8]
+        switch (keyType as CFString, keySizeInBits) {
+        case (kSecAttrKeyTypeRSA, 2048):
+            header = rsa2048SPKIHeader
+        case (kSecAttrKeyTypeECSECPrimeRandom, 256):
+            header = ecdsaSecp256r1SPKIHeader
+        default:
+            return nil
+        }
+        var full = Data(header)
+        full.append(rawPublicKeyRepresentation)
         let digest = SHA256.hash(data: full)
         return Data(digest).base64EncodedString()
     }
