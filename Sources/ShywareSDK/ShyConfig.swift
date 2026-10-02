@@ -301,6 +301,26 @@ public struct RuntimeFallbacks: Codable, Sendable {
         self.writeOnlyOnHostileNetwork = writeOnlyOnHostileNetwork
         self.writeOnlyOnHSMUnavailable = writeOnlyOnHSMUnavailable
     }
+    // Every runtime_fallbacks flag is optional in shyconfig.schema.json (no
+    // "required" array on this object) and the Go server treats a missing
+    // key as false (encoding/json leaves a zero-value bool alone -- it
+    // doesn't error on an absent non-pointer field). Swift's auto-
+    // synthesized Decodable has no such leniency: every non-optional stored
+    // property must be present, memberwise init defaults notwithstanding --
+    // those only apply to programmatic construction, never to decoding. A
+    // real shyconfig.json (Populist's bundled one) that omits even one of
+    // these four keys used to fail this decode entirely, which failed
+    // ShyConfig's decode, which failed VotingClient.from(config:), which
+    // meant *every* vote and bookmark call failed before any network
+    // request was ever made -- confirmed via a real device's exported
+    // RemoteLogger output: "keyNotFound: write_only_on_hsm_unavailable".
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        writeOnlyOnMissingPlayIntegrity = (try? c.decodeIfPresent(Bool.self, forKey: .writeOnlyOnMissingPlayIntegrity)) ?? false
+        writeOnlyOnUntrustedDeviceAttestation = (try? c.decodeIfPresent(Bool.self, forKey: .writeOnlyOnUntrustedDeviceAttestation)) ?? false
+        writeOnlyOnHostileNetwork = (try? c.decodeIfPresent(Bool.self, forKey: .writeOnlyOnHostileNetwork)) ?? false
+        writeOnlyOnHSMUnavailable = (try? c.decodeIfPresent(Bool.self, forKey: .writeOnlyOnHSMUnavailable)) ?? false
+    }
     public static func none() -> RuntimeFallbacks { RuntimeFallbacks() }
 }
 
