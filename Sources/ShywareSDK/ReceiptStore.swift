@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Security
 
@@ -80,6 +81,88 @@ public class KeychainReceiptStore {
     }
 
     public enum ReceiptStoreError: Error {
+        case keychainFailure(OSStatus)
+    }
+}
+
+/// Stores one Ed25519 per-poll voter keypair per poll_id in the iOS Keychain,
+/// same accessibility/service-naming pattern as KeychainReceiptStore above
+/// (device-bound, survives app reinstall).
+///
+/// This exists because VotingClient.buildBallot previously generated a fresh
+/// Curve25519.Signing.PrivateKey() on every single call, with no persistence
+/// at all. That meant any retry after a transient failure (a network blip,
+/// an unrelated downstream error, even just the user tapping twice) looked
+/// like a *different* voter to the IDV attestation enclave's one-time-use-
+/// per-poll replay guard, permanently orphaning that poll for the
+/// underlying Didit session on the very first failed attempt -- regardless
+/// of whether the ballot itself ever actually reached canonical state.
+/// Found live 2026-10-03 after fixing the exact same bug in the web SDK
+/// (votingClient.js's buildVoteEnvelope) and failing to also apply it here,
+/// where it was actually being exercised in testing all along.
+public class KeychainVoterKeyStore {
+    let service: String
+
+    public init(appId: String) {
+        self.service = "com.comission.shyware.\(appId).voterkeys"
+    }
+
+    /// Returns the existing per-poll keypair if one was already generated
+    /// for this poll, or generates, persists, and returns a new one.
+    /// Callers should always go through this rather than constructing their
+    /// own Curve25519.Signing.PrivateKey() directly for a per-poll ballot.
+    public func keypair(forPollId pollId: String) throws -> Curve25519.Signing.PrivateKey {
+        if let existing = try load(pollId: pollId) {
+            return existing
+        }
+        let fresh = Curve25519.Signing.PrivateKey()
+        try save(fresh, pollId: pollId)
+        return fresh
+    }
+
+    private func save(_ key: Curve25519.Signing.PrivateKey, pollId: String) throws {
+        let data = key.rawRepresentation
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: pollId,
+            kSecValueData: data,
+            kSecAttrAccessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        SecItemDelete(query as CFDictionary)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw VoterKeyStoreError.keychainFailure(status)
+        }
+    }
+
+    private func load(pollId: String) throws -> Curve25519.Signing.PrivateKey? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: pollId,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else {
+            return nil
+        }
+        return try Curve25519.Signing.PrivateKey(rawRepresentation: data)
+    }
+
+    /// Deletes all per-poll voter keys for this deployment. Called during
+    /// privacy wipe, same as KeychainReceiptStore.deleteAll().
+    public func deleteAll() {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    public enum VoterKeyStoreError: Error {
         case keychainFailure(OSStatus)
     }
 }

@@ -75,6 +75,7 @@ public actor VotingClient {
     public nonisolated let manifest: ShyConfig
     private var signals: RuntimeSignals
     private let receiptStore: KeychainReceiptStore
+    private let voterKeyStore: KeychainVoterKeyStore
     private let session: URLSession
     private let assertionProvider: ShyAssertionProvider?
     private let firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?
@@ -130,6 +131,7 @@ public actor VotingClient {
         self.manifest = manifest
         self.signals = .untrusted
         self.receiptStore = KeychainReceiptStore(appId: manifest.app.id)
+        self.voterKeyStore = KeychainVoterKeyStore(appId: manifest.app.id)
         self.session = URLSession.shared
         self.assertionProvider = assertionProvider
         self.firebaseIDTokenProvider = firebaseIDTokenProvider
@@ -304,8 +306,16 @@ public actor VotingClient {
         let nonce = randomHex(32)
         let ballotId = sha256hex(nonce)
 
-        // Per-poll Ed25519 keypair, generated fresh on-device for this ballot.
-        let voterKey = Curve25519.Signing.PrivateKey()
+        // Per-poll Ed25519 keypair -- persisted in the Keychain and reused
+        // across calls for the same pollId, not regenerated fresh every
+        // time. Generating fresh on every call means every retry after a
+        // transient failure looks like a different voter to the IDV
+        // attestation enclave's one-time-use-per-poll replay guard,
+        // permanently orphaning that poll for the underlying Didit session
+        // on the very first failed attempt, regardless of whether the
+        // ballot itself ever reached canonical state. Confirmed live
+        // 2026-10-03: this was happening on every single poll tested.
+        let voterKey = try voterKeyStore.keypair(forPollId: pollId)
         let voterPubKeyHex = voterKey.publicKey.rawRepresentation
             .map { String(format: "%02x", $0) }.joined()
         let deviceMessage = Data((nonce + ":" + pollId).utf8)
