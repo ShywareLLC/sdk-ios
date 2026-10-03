@@ -497,7 +497,7 @@ public actor VotingClient {
             req.setValue(String(decoding: token, as: UTF8.self), forHTTPHeaderField: "X-Attest-Token")
             req.setValue("ios", forHTTPHeaderField: "X-Attest-Platform")
         }
-        if let firebaseIDTokenProvider, let idToken = try? await firebaseIDTokenProvider(), let idToken {
+        if let firebaseIDTokenProvider, let idToken = try? await firebaseIDTokenProvider() {
             req.setValue("Bearer \(idToken)", forHTTPHeaderField: "Authorization")
         }
     }
