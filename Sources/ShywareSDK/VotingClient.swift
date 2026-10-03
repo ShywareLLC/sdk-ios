@@ -63,12 +63,21 @@ public struct PostureOverride: Decodable, Sendable {
 /// `AppAttestProvider.attestToken(requestData:)`, which builds exactly this string.
 public typealias ShyAssertionProvider = (Data) async throws -> Data
 
+/// Supplies a fresh Firebase ID token on demand (e.g.
+/// `{ try await Auth.auth().currentUser?.getIDToken() }`). Independent of
+/// `ShyAssertionProvider`/`api.auth_scheme` -- see the doc comment on
+/// `firebaseIDTokenProvider` in `VotingClient.from` for why these are two
+/// separate, stackable server-side gates rather than alternative "auth
+/// schemes", despite `api.auth_scheme` suggesting a single choice.
+public typealias ShyFirebaseIDTokenProvider = () async throws -> String?
+
 public actor VotingClient {
     public nonisolated let manifest: ShyConfig
     private var signals: RuntimeSignals
     private let receiptStore: KeychainReceiptStore
     private let session: URLSession
     private let assertionProvider: ShyAssertionProvider?
+    private let firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?
     private let enclaveClient: EnclaveAttestationClient?
 
     /// Operator-pushed posture. Fetched from `deployment.posture_endpoint` on init.
@@ -87,17 +96,43 @@ public actor VotingClient {
     /// - Parameter assertionProvider: Required when `api.auth_scheme == "app_attest"`.
     ///   The closure receives raw request data and must return assertion bytes.
     ///   Use `AppAttestProvider.assert(requestData:)` or wrap your own `AppAttestService`.
-    public static func from(_ shyconfig: ShyConfig, assertionProvider: ShyAssertionProvider? = nil) throws -> VotingClient {
+    /// - Parameter firebaseIDTokenProvider: Pass when the relay is deployed with
+    ///   `--firebase-creds`, which wraps *every* POST route (including `/ballots`)
+    ///   in an unconditional Firebase-JWT check (`middleware.FirebaseAuth.OnWrites`
+    ///   in `ShywareLLC/core`) regardless of `api.auth_scheme`. This is a separate,
+    ///   stackable server-side gate from the device-attestation check inside
+    ///   `submitBallot` itself (`s.attester`, controlled by whether the relay was
+    ///   given `--ios-app-attest-team-id`) -- `api.auth_scheme` only describes which
+    ///   *device*-attestation mechanism this client uses, not whether the relay's
+    ///   outer Firebase gate is active, so don't assume setting `auth_scheme:
+    ///   "app_attest"` means this provider is unnecessary. Found live 2026-10-03:
+    ///   a deployment with `auth_scheme: "app_attest"` and device-attestation
+    ///   enforcement intentionally still off (no `--ios-app-attest-team-id`) had
+    ///   every real `castBallot` call 401 at this exact gate, because nothing set
+    ///   this header -- `app_attest`'s own `assertionProvider` only ever sets
+    ///   `X-Attest-Token`, never `Authorization`. Required for a deployment outside
+    ///   a sanctioned/coercion-resistant jurisdiction, where attestation enforcement
+    ///   is reserved for that posture rather than used as this deployment's write
+    ///   gate; not a privacy regression for canonical state (which stays exactly as
+    ///   unlinkable either way) -- it does expose "this Firebase UID submitted to
+    ///   this poll at this time" to the relay's own request log, an accepted
+    ///   tradeoff for this deployment, not a change to what's ever written on-chain.
+    public static func from(
+        _ shyconfig: ShyConfig,
+        assertionProvider: ShyAssertionProvider? = nil,
+        firebaseIDTokenProvider: ShyFirebaseIDTokenProvider? = nil
+    ) throws -> VotingClient {
         try assertVotingManifest(shyconfig)
-        return VotingClient(manifest: shyconfig, assertionProvider: assertionProvider)
+        return VotingClient(manifest: shyconfig, assertionProvider: assertionProvider, firebaseIDTokenProvider: firebaseIDTokenProvider)
     }
 
-    private init(manifest: ShyConfig, assertionProvider: ShyAssertionProvider?) {
+    private init(manifest: ShyConfig, assertionProvider: ShyAssertionProvider?, firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?) {
         self.manifest = manifest
         self.signals = .untrusted
         self.receiptStore = KeychainReceiptStore(appId: manifest.app.id)
         self.session = URLSession.shared
         self.assertionProvider = assertionProvider
+        self.firebaseIDTokenProvider = firebaseIDTokenProvider
         // Deployment-specific: each Shyware consumer configures its own
         // attestation-service endpoint in its own shyconfig. `enclaveClient`
         // is nil (and buildBallot's Didit-attestation path is unavailable)
@@ -447,15 +482,23 @@ public actor VotingClient {
     ///   `r.Header.Get("X-Attest-Token")`). Fails silently if the provider is
     ///   nil — the server will reject unauthenticated requests (401, or
     ///   write-only fallback per the deployment's runtime_fallbacks).
-    /// - `firebase_bearer`: no-op here; the caller (SwiftUI/ViewModel layer)
-    ///   is responsible for setting `Authorization: Bearer <idToken>` on the
-    ///   `URLSession` or on each request before it reaches this client.
+    /// - `firebase_bearer`: historically a no-op here (see `firebaseIDTokenProvider`
+    ///   below for why that was wrong in practice -- nothing outside this client
+    ///   ever actually set the header this comment described).
+    ///
+    /// Device-attestation (`X-Attest-Token`) and the relay's outer Firebase gate
+    /// (`Authorization: Bearer`) are independent checks -- both run below,
+    /// unconditionally on whether `firebaseIDTokenProvider` was supplied,
+    /// regardless of `api.auth_scheme`. See the doc comment on
+    /// `firebaseIDTokenProvider` in `from(_:assertionProvider:firebaseIDTokenProvider:)`.
     private func injectAuth(_ req: inout URLRequest, requestData: Data) async throws {
-        guard manifest.api.requiresAuth, manifest.api.authScheme == "app_attest" else { return }
-        guard let provider = assertionProvider else { return }
-        if let token = try? await provider(requestData) {
+        if manifest.api.requiresAuth, manifest.api.authScheme == "app_attest", let provider = assertionProvider,
+           let token = try? await provider(requestData) {
             req.setValue(String(decoding: token, as: UTF8.self), forHTTPHeaderField: "X-Attest-Token")
             req.setValue("ios", forHTTPHeaderField: "X-Attest-Platform")
+        }
+        if let firebaseIDTokenProvider, let idToken = try? await firebaseIDTokenProvider(), let idToken {
+            req.setValue("Bearer \(idToken)", forHTTPHeaderField: "Authorization")
         }
     }
 
