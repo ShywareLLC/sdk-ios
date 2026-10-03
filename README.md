@@ -76,17 +76,47 @@ let config = ShyConfig(
     deployment: DeploymentConfig()
 )
 
-let client = try VotingClient.from(config)
+let client = try VotingClient.from(
+    config,
+    // Required when the relay is deployed with --firebase-creds, which gates
+    // EVERY POST route (including /ballots) behind a Firebase JWT check,
+    // independent of api.auth_scheme -- see the doc comment on
+    // VotingClient.from in VotingClient.swift for the full rationale (this
+    // is a separate, stackable gate from app_attest device attestation, not
+    // an alternative to it).
+    firebaseIDTokenProvider: { try await Auth.auth().currentUser?.getIDToken() }
+)
 
 // Cast a ballot (L1 + L2 two-list atomic write)
 let ballot = try await client.castBallot(
     pollId: "poll-2026-general",
     choice: "yes",
-    input: .didit(personId: "user-didit-person-id")
+    input: .didit(personId: "user-didit-person-id"),
+    diditSessionId: "the-persons-current-didit-session-id"
 )
 // ballot.ballotId    — server-assigned direction-free identifier (List 1)
 // ballot.ballotNonce — local nonce for inclusion-proof recovery
+
+// Change your mind, or rescind entirely -- both reuse the SAME per-poll
+// device key as the original cast (persisted in the Keychain automatically,
+// see "Per-poll key persistence" below), so the chain recognizes it as an
+// update to the existing vote rather than a second, duplicate one.
+try await client.updateBallot(pollId: "poll-2026-general", newChoices: ["no"])
+try await client.rescindBallot(pollId: "poll-2026-general")
 ```
+
+### Per-poll key persistence
+
+`buildBallot`/`castBallot` persist each poll's per-poll Ed25519 signing key in
+the Keychain (`KeychainVoterKeyStore`, device-bound, same accessibility as
+`KeychainReceiptStore`) and reuse it on every later call for that `pollId`,
+rather than generating a fresh one every time. This matters beyond avoiding
+redundant work: the IDV attestation enclave's one-time-use-per-poll replay
+guard permanently rejects a *second* key for a poll it's already signed for —
+so if a client ever generated a fresh key on every retry, the very first
+failed attempt (even one unrelated to the key itself) would permanently
+orphan that poll for the user's Didit session. Don't bypass this store by
+constructing your own `Curve25519.Signing.PrivateKey()` for ballot signing.
 
 ---
 
