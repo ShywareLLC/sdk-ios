@@ -377,6 +377,81 @@ public actor VotingClient {
         return BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: identityHash, txJson: txJson)
     }
 
+    // MARK: - Build (update)
+
+    /// Builds a fully signed TxTypeUpdateBallot envelope matching the real
+    /// server's wire schema (ShywareLLC/core protocol/tx/tx.go `BallotUpdateData`).
+    /// `newChoices: []` represents a rescission (withdrawal) rather than a
+    /// replacement — matches the Go core's own convention.
+    ///
+    /// Reuses the SAME per-poll keypair as the original cast (via
+    /// `voterKeyStore.keypair(forPollId:)`, which loads rather than
+    /// regenerates) — required: the chain re-derives `identity_hash` from
+    /// `voter_pub_key`, so a different key here would register as a
+    /// different voter entirely, not an update to the existing one.
+    ///
+    /// Device signature message is `"update:" + newNonce + ":" + pollId`
+    /// (matches `ballotrules.BallotUpdateDeviceSigMessage` in
+    /// ShywareLLC/core/protocol/ballotrules/ballotrules.go) — the "update:"
+    /// prefix is what stops a cast-time signature being replayed as an update.
+    public func buildBallotUpdate(
+        pollId: String,
+        newChoices: [String],
+        oldBallotId: String,
+        diditSessionId: String? = nil
+    ) async throws -> BallotResult {
+        let nonce = randomHex(32)
+        let ballotId = sha256hex(nonce)
+
+        let voterKey = try voterKeyStore.keypair(forPollId: pollId)
+        let voterPubKeyHex = voterKey.publicKey.rawRepresentation
+            .map { String(format: "%02x", $0) }.joined()
+        let deviceMessage = Data(("update:" + nonce + ":" + pollId).utf8)
+        let voterSig = try voterKey.signature(for: deviceMessage)
+
+        let identityHash = sha256hex(voterPubKeyHex + pollId)
+        let beacon = try await fetchBeacon()
+
+        var data: [String: Any] = [
+            "scoping_id": pollId,
+            "old_submission_id": oldBallotId,
+            "new_submission_nonce": nonce,
+            "beacon_block_hash": beacon.hash,
+            "beacon_block_height": beacon.height,
+            "new_choices": newChoices,
+            "timestamp": Int(Date().timeIntervalSince1970),
+            "voter_pub_key": voterPubKeyHex,
+            "voter_sig": voterSig.base64EncodedString(),
+        ]
+
+        // idv_attestation_sig is required unconditionally by the Go
+        // verifier's VerifyAndIdentifyUpdate, same as at cast time — see
+        // buildBallot's own comment above for the full rationale. The
+        // enclave's replay guard is idempotent for the same (session_id,
+        // poll_id, voter_pub_key) triple, so reusing the cast-time session
+        // id here (when still on hand) works with no enclave changes.
+        if let diditSessionId, !diditSessionId.isEmpty {
+            guard let enclaveClient else {
+                throw ShywareError.invalidManifest(
+                    "identity.attestation_service_base_url is not configured, but a Didit session_id was provided to buildBallotUpdate"
+                )
+            }
+            let sigBytes = try await enclaveClient.attest(
+                sessionId: diditSessionId,
+                voterPubKeyHex: voterPubKeyHex,
+                pollId: pollId
+            )
+            data["idv_attestation_sig"] = sigBytes.base64EncodedString()
+            data["didit_session_id"] = diditSessionId
+        }
+
+        let envelope: [String: Any] = ["type": 6, "signature": "AQ==", "data": data]
+        let txData = try JSONSerialization.data(withJSONObject: envelope)
+        let txJson = String(decoding: txData, as: UTF8.self)
+
+        return BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: identityHash, txJson: txJson)
+    }
+
     // MARK: - Submit
 
     /// Submits an already-built, signed ballot envelope (from `buildBallot`) to
@@ -414,6 +489,51 @@ public actor VotingClient {
             try? receiptStore.save(receipt)
         }
         return result
+    }
+
+    /// Updates (replaces or rescinds, when `newChoices` is empty) a
+    /// previously cast ballot for `pollId`. Requires a local receipt from
+    /// the original cast (`receiptStore.load`) to supply `old_submission_id`
+    /// — this is the device-receipt path (`router.go`'s `updateBallot`,
+    /// `POST /ballots/update` with `{"tx": "<json Tx>"}`), not the
+    /// server-reconciled path, since the client already holds its own
+    /// receipt. Throws if no receipt exists for this poll on this device.
+    @discardableResult
+    public func updateBallot(
+        pollId: String,
+        newChoices: [String],
+        diditSessionId: String? = nil
+    ) async throws -> BallotResult {
+        guard let receipt = try receiptStore.load(pollId: pollId) else {
+            throw ShywareError.invalidInput("No existing receipt for poll \(pollId) — cannot update a ballot that was never cast on this device")
+        }
+        let result = try await buildBallotUpdate(
+            pollId: pollId,
+            newChoices: newChoices,
+            oldBallotId: receipt.ballotId,
+            diditSessionId: diditSessionId
+        )
+        try await post("/ballots/update", body: ["tx": result.txJson])
+
+        if newChoices.isEmpty {
+            receiptStore.delete(pollId: pollId)
+        } else {
+            let newReceipt = BallotReceipt(
+                pollId: pollId,
+                ballotId: result.ballotId,
+                ballotNonce: result.ballotNonce,
+                choice: newChoices[0],
+                identityHash: result.identityHash
+            )
+            try? receiptStore.save(newReceipt)
+        }
+        return result
+    }
+
+    /// Convenience: withdraw a previously cast ballot entirely.
+    @discardableResult
+    public func rescindBallot(pollId: String, diditSessionId: String? = nil) async throws -> BallotResult {
+        try await updateBallot(pollId: pollId, newChoices: [], diditSessionId: diditSessionId)
     }
 
     // MARK: - Verify
