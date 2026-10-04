@@ -76,7 +76,6 @@ public actor VotingClient {
     private var signals: RuntimeSignals
     private let receiptStore: KeychainReceiptStore
     private let voterKeyStore: KeychainVoterKeyStore
-    private let registeredCredentialStore: SecureEnclaveCredentialStore
     private let session: URLSession
     private let assertionProvider: ShyAssertionProvider?
     private let firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?
@@ -133,7 +132,6 @@ public actor VotingClient {
         self.signals = .untrusted
         self.receiptStore = KeychainReceiptStore(appId: manifest.app.id)
         self.voterKeyStore = KeychainVoterKeyStore(appId: manifest.app.id)
-        self.registeredCredentialStore = SecureEnclaveCredentialStore(appId: manifest.app.id)
         self.session = URLSession.shared
         self.assertionProvider = assertionProvider
         self.firebaseIDTokenProvider = firebaseIDTokenProvider
@@ -286,72 +284,6 @@ public actor VotingClient {
         return (hash, height)
     }
 
-    // MARK: - Registered credential
-
-    /// Registers this device's Secure Enclave credential against a Firebase
-    /// UID: calls the IDV attestation enclave's
-    /// `POST /register-browser-credential` (re-verifies `sessionId` against
-    /// Didit AND `firebaseIdToken` against Firebase's JWKS independently),
-    /// then submits `TxTypeRegisterIdentity` to the chain via the relay's
-    /// `POST /identity/register`. Call once, after a real Didit session has
-    /// reached Approved -- every subsequent `buildBallot`/`buildBallotUpdate`
-    /// call on this device automatically signs with the registered
-    /// credential afterward (see `registrationFields` below), with no
-    /// further Didit session required per vote.
-    public func registerDevice(sessionId: String, firebaseIdToken: String) async throws {
-        guard let enclaveClient else {
-            throw ShywareError.invalidManifest(
-                "identity.attestation_service_base_url is not configured; cannot register a device credential"
-            )
-        }
-        let publicKeyHex = try registeredCredentialStore.publicKeyHex()
-        let enclaveResponse = try await enclaveClient.registerCredential(
-            sessionId: sessionId,
-            registrationPubKeyHex: publicKeyHex,
-            firebaseIdToken: firebaseIdToken
-        )
-        let data: [String: Any] = [
-            "registration_pub_key": enclaveResponse.registrationPubKey,
-            "firebase_uid": enclaveResponse.firebaseUid,
-            "didit_session_id": enclaveResponse.sessionId,
-            "timestamp": Int(Date().timeIntervalSince1970),
-            "registration_binding_sig": enclaveResponse.registrationBindingSigHex.isEmpty
-                ? ""
-                : (Data(hexString: enclaveResponse.registrationBindingSigHex) ?? Data()).base64EncodedString(),
-        ]
-        let envelope: [String: Any] = ["type": 11, "signature": "AQ==", "data": data]
-        let txData = try JSONSerialization.data(withJSONObject: envelope)
-        let txJson = String(decoding: txData, as: UTF8.self)
-        try await post("/identity/register", body: ["tx": txJson])
-    }
-
-    public func hasRegisteredCredential() -> Bool {
-        registeredCredentialStore.hasRegisteredCredential()
-    }
-
-    /// Mutually exclusive with the Didit-attestation fields built by the
-    /// caller: once `registration_pub_key` is present, the chain's
-    /// `deriveBallotIdentityHash`/`deriveBallotUpdateIdentityHash`
-    /// (ShywareLLC/core domain/state/registration.go) ignore
-    /// `idv_attestation_sig`/`didit_session_id` entirely for identity
-    /// derivation -- but `validateBallotCast`'s global one-session-ever
-    /// check still runs unconditionally on `didit_session_id` if present,
-    /// so callers should not also pass a `diditSessionId` once registered
-    /// (same guard as votingClient.js's buildVoteEnvelope/buildUpdateEnvelope).
-    private func registrationFields(voterPubKeyHex: String, pollId: String, prefix: String) -> [String: Any] {
-        guard registeredCredentialStore.hasRegisteredCredential(),
-              let key = try? registeredCredentialStore.keypair(),
-              let sig = try? signWithRegisteredCredential(key, message: "\(prefix)\(voterPubKeyHex):\(pollId)")
-        else {
-            return [:]
-        }
-        let publicKeyHex = key.publicKey.x963Representation.map { String(format: "%02x", $0) }.joined()
-        return [
-            "registration_pub_key": publicKeyHex,
-            "registration_sig": sig.base64EncodedString(),
-        ]
-    }
-
     // MARK: - Build
 
     /// Builds a fully signed TxTypeBallotCast envelope matching the real server's
@@ -389,11 +321,13 @@ public actor VotingClient {
         let deviceMessage = Data((nonce + ":" + pollId).utf8)
         let voterSig = try voterKey.signature(for: deviceMessage)
 
-        // Canonical identity_hash for the default (non-ZK) IDV-attestation
-        // embodiment — matches the Go server's diditIdentityHash exactly:
-        // sha256(voter_pub_key || poll_id). Used only for the local receipt below,
-        // not sent on the wire (the server re-derives it from voter_pub_key).
-        let identityHash = sha256hex(voterPubKeyHex + pollId)
+        // identity_hash is enclave-attested (sha256(didit_document_key ||
+        // poll_id), computed inside the enclave from Didit's id_verification
+        // document data -- this device never sees the document data behind
+        // it). Populated below once the enclave call returns; used both on
+        // the wire (required for the chain to verify idv_attestation_sig,
+        // which covers it) and for the local receipt.
+        var identityHash = ""
 
         let beacon = try await fetchBeacon()
 
@@ -407,9 +341,6 @@ public actor VotingClient {
             "voter_pub_key": voterPubKeyHex,
             "voter_sig": voterSig.base64EncodedString(),
         ]
-        for (key, value) in registrationFields(voterPubKeyHex: voterPubKeyHex, pollId: pollId, prefix: "vote:") {
-            data[key] = value
-        }
 
         // idv_attestation_sig: obtained from the IDV attestation enclave, an
         // independent OCI AMD SEV-SNP confidential-computing service that holds
@@ -426,23 +357,21 @@ public actor VotingClient {
         // `input` is accepted for interface stability but not otherwise used —
         // the enclave, not this device, is the party attesting the keypair.
         _ = input
-        // Skipped once a registration_pub_key is already attached above --
-        // see registrationFields' doc comment for why combining both would
-        // risk tripping the chain's global one-session-ever check on a
-        // session this vote doesn't actually need.
-        if let diditSessionId, !diditSessionId.isEmpty, data["registration_pub_key"] == nil {
+        if let diditSessionId, !diditSessionId.isEmpty {
             guard let enclaveClient else {
                 throw ShywareError.invalidManifest(
                     "identity.attestation_service_base_url is not configured, but a Didit session_id was provided to buildBallot"
                 )
             }
-            let sigBytes = try await enclaveClient.attest(
+            let attestation = try await enclaveClient.attest(
                 sessionId: diditSessionId,
                 voterPubKeyHex: voterPubKeyHex,
                 pollId: pollId
             )
-            data["idv_attestation_sig"] = sigBytes.base64EncodedString()
+            data["idv_attestation_sig"] = attestation.signature.base64EncodedString()
             data["didit_session_id"] = diditSessionId
+            data["identity_hash"] = attestation.identityHash
+            identityHash = attestation.identityHash
         }
 
         let envelope: [String: Any] = ["type": 2, "signature": "AQ==", "data": data]
@@ -484,7 +413,8 @@ public actor VotingClient {
         let deviceMessage = Data(("update:" + nonce + ":" + pollId).utf8)
         let voterSig = try voterKey.signature(for: deviceMessage)
 
-        let identityHash = sha256hex(voterPubKeyHex + pollId)
+        // identity_hash is enclave-attested -- see buildBallot's identical comment above.
+        var identityHash = ""
         let beacon = try await fetchBeacon()
 
         var data: [String: Any] = [
@@ -498,9 +428,6 @@ public actor VotingClient {
             "voter_pub_key": voterPubKeyHex,
             "voter_sig": voterSig.base64EncodedString(),
         ]
-        for (key, value) in registrationFields(voterPubKeyHex: voterPubKeyHex, pollId: pollId, prefix: "update:") {
-            data[key] = value
-        }
 
         // idv_attestation_sig is required unconditionally by the Go
         // verifier's VerifyAndIdentifyUpdate, same as at cast time — see
@@ -508,20 +435,21 @@ public actor VotingClient {
         // enclave's replay guard is idempotent for the same (session_id,
         // poll_id, voter_pub_key) triple, so reusing the cast-time session
         // id here (when still on hand) works with no enclave changes.
-        // Skipped once registered (see buildBallot's identical guard).
-        if let diditSessionId, !diditSessionId.isEmpty, data["registration_pub_key"] == nil {
+        if let diditSessionId, !diditSessionId.isEmpty {
             guard let enclaveClient else {
                 throw ShywareError.invalidManifest(
                     "identity.attestation_service_base_url is not configured, but a Didit session_id was provided to buildBallotUpdate"
                 )
             }
-            let sigBytes = try await enclaveClient.attest(
+            let attestation = try await enclaveClient.attest(
                 sessionId: diditSessionId,
                 voterPubKeyHex: voterPubKeyHex,
                 pollId: pollId
             )
-            data["idv_attestation_sig"] = sigBytes.base64EncodedString()
+            data["idv_attestation_sig"] = attestation.signature.base64EncodedString()
             data["didit_session_id"] = diditSessionId
+            data["identity_hash"] = attestation.identityHash
+            identityHash = attestation.identityHash
         }
 
         let envelope: [String: Any] = ["type": 6, "signature": "AQ==", "data": data]

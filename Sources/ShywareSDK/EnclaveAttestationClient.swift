@@ -13,34 +13,33 @@ import Security
 // API before signing, rather than trusting the caller's claim that the
 // session is valid.
 //
-// Wire contract (matches the enclave's actual deployed API, not a proposal):
+// Wire contract (matches the enclave's actual deployed API):
 //   POST /attest
 //   Request:  {"session_id": "...", "voter_pub_key": "...", "poll_id": "..."}
-//   Response: {"idv_attestation_sig": "<hex>", "voter_pub_key": "...",
-//              "poll_id": "...", "session_id": "..."}
+//   Response: {"idv_attestation_sig": "<hex>", "identity_hash": "<hex>",
+//              "voter_pub_key": "...", "poll_id": "...", "session_id": "..."}
 //
-// Message format note (flagged, not silently resolved): the enclave signs
-// sha256("<voter_pub_key>:<poll_id>") — a colon-joined UTF-8 string — before
-// hex-encoding the Ed25519 signature. ShywareLLC/core's existing verifier
-// (services/identity/didit.go diditDeviceAttestMessage) instead checks
-// sha256(voter_pub_key || poll_id) — a bare concatenation, no separator, and
-// the same convention used consistently across every other embodiment in
-// that file (confirm-receipt, ZK commitment, ballot update). This client
-// does not attempt to paper over that mismatch: it calls the enclave exactly
-// as documented and forwards exactly what comes back, because the fix
-// belongs on whichever side is wrong (most likely the enclave, since the
-// Go core's no-separator convention is the established one) — see the
-// commit message / task report for the flagged conflict. Do not "fix" this
-// by reformatting the message on the client; the client never constructs
-// the signed message, only the enclave does.
+// identity_hash is computed by the enclave from Didit's id_verification
+// document data (document_type + issuing country + document_number) --
+// Didit's real API has no "person_id" field, so this document key is the
+// closest real stable-across-sessions signal it actually provides. Raw
+// document data never leaves the enclave; only this one-way hash does.
+// idv_attestation_sig covers sha256(voter_pub_key || poll_id ||
+// identity_hash) -- bare concatenation, no separator, matching
+// services/identity/didit.go's diditDeviceAttestMessage exactly. Both
+// idv_attestation_sig and identity_hash must be included on the resulting
+// ballot's wire data (see VotingClient.buildBallot) -- the chain has no way
+// to recompute identity_hash itself, only to verify the signature over it.
 public struct EnclaveAttestationResponse: Decodable, Sendable {
     public let idvAttestationSigHex: String
+    public let identityHash: String
     public let voterPubKey: String
     public let pollId: String
     public let sessionId: String
 
     enum CodingKeys: String, CodingKey {
         case idvAttestationSigHex = "idv_attestation_sig"
+        case identityHash = "identity_hash"
         case voterPubKey = "voter_pub_key"
         case pollId = "poll_id"
         case sessionId = "session_id"
@@ -111,8 +110,11 @@ public actor EnclaveAttestationClient {
     ///
     /// - Returns: the raw Ed25519 signature bytes (decoded from the enclave's
     ///   hex response), ready to be base64-encoded into the outgoing
-    ///   `idv_attestation_sig` transaction field.
-    public func attest(sessionId: String, voterPubKeyHex: String, pollId: String) async throws -> Data {
+    ///   `idv_attestation_sig` transaction field, and the enclave's
+    ///   `identity_hash` (hex) — required on the same transaction's
+    ///   `identity_hash` field. The chain verifies the signature covers it;
+    ///   it never recomputes identity_hash itself.
+    public func attest(sessionId: String, voterPubKeyHex: String, pollId: String) async throws -> (signature: Data, identityHash: String) {
         guard let url = URL(string: baseURL + "/attest") else {
             throw EnclaveAttestationError.invalidURL
         }
@@ -134,54 +136,7 @@ public actor EnclaveAttestationClient {
         guard let sigBytes = Data(hexString: decoded.idvAttestationSigHex) else {
             throw EnclaveAttestationError.invalidSignatureHex
         }
-        return sigBytes
-    }
-
-    /// Requests the enclave's registration-binding signature for the
-    /// registered-credential embodiment: `POST /register-browser-credential`
-    /// (same endpoint name on both iOS and web -- see
-    /// ShywareLLC/sdk/providers/registeredCredential.js). The enclave
-    /// independently re-verifies `sessionId` against Didit's real
-    /// session-status API AND `firebaseIdToken` against Firebase's public
-    /// JWKS before signing -- neither check happens on-device or on this
-    /// chain (ValidateTx must stay deterministic across every validator).
-    public func registerCredential(
-        sessionId: String,
-        registrationPubKeyHex: String,
-        firebaseIdToken: String
-    ) async throws -> EnclaveRegistrationResponse {
-        guard let url = URL(string: baseURL + "/register-browser-credential") else {
-            throw EnclaveAttestationError.invalidURL
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: String] = [
-            "session_id": sessionId,
-            "registration_pub_key": registrationPubKeyHex,
-            "firebase_id_token": firebaseIdToken,
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, response) = try await session.data(for: req)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw EnclaveAttestationError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
-        }
-        return try JSONDecoder().decode(EnclaveRegistrationResponse.self, from: data)
-    }
-}
-
-public struct EnclaveRegistrationResponse: Decodable, Sendable {
-    public let registrationBindingSigHex: String
-    public let registrationPubKey: String
-    public let firebaseUid: String
-    public let sessionId: String
-
-    enum CodingKeys: String, CodingKey {
-        case registrationBindingSigHex = "registration_binding_sig"
-        case registrationPubKey = "registration_pub_key"
-        case firebaseUid = "firebase_uid"
-        case sessionId = "session_id"
+        return (sigBytes, decoded.identityHash)
     }
 }
 
