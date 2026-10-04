@@ -136,6 +136,53 @@ public actor EnclaveAttestationClient {
         }
         return sigBytes
     }
+
+    /// Requests the enclave's registration-binding signature for the
+    /// registered-credential embodiment: `POST /register-browser-credential`
+    /// (same endpoint name on both iOS and web -- see
+    /// ShywareLLC/sdk/providers/registeredCredential.js). The enclave
+    /// independently re-verifies `sessionId` against Didit's real
+    /// session-status API AND `firebaseIdToken` against Firebase's public
+    /// JWKS before signing -- neither check happens on-device or on this
+    /// chain (ValidateTx must stay deterministic across every validator).
+    public func registerCredential(
+        sessionId: String,
+        registrationPubKeyHex: String,
+        firebaseIdToken: String
+    ) async throws -> EnclaveRegistrationResponse {
+        guard let url = URL(string: baseURL + "/register-browser-credential") else {
+            throw EnclaveAttestationError.invalidURL
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: String] = [
+            "session_id": sessionId,
+            "registration_pub_key": registrationPubKeyHex,
+            "firebase_id_token": firebaseIdToken,
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: req)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw EnclaveAttestationError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        }
+        return try JSONDecoder().decode(EnclaveRegistrationResponse.self, from: data)
+    }
+}
+
+public struct EnclaveRegistrationResponse: Decodable, Sendable {
+    public let registrationBindingSigHex: String
+    public let registrationPubKey: String
+    public let firebaseUid: String
+    public let sessionId: String
+
+    enum CodingKeys: String, CodingKey {
+        case registrationBindingSigHex = "registration_binding_sig"
+        case registrationPubKey = "registration_pub_key"
+        case firebaseUid = "firebase_uid"
+        case sessionId = "session_id"
+    }
 }
 
 /// Pins TLS connections to one configured host to the public key of one
