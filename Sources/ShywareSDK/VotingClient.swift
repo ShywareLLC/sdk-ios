@@ -543,6 +543,122 @@ public actor VotingClient {
         try await updateBallot(pollId: pollId, newChoices: [], diditSessionId: diditSessionId)
     }
 
+    // MARK: - Recovery (no local receipt)
+
+    /// Attempts a server-reconciled ballot update — `POST /ballots/update`
+    /// with a flat body (no `{"tx": ...}` wrapper, unlike `updateBallot`
+    /// above) — for a participant whose `identity_hash` may already be
+    /// registered on this poll from a DIFFERENT device or app install, even
+    /// though this device holds no local receipt for it. This is real
+    /// cross-device/reinstall recovery, not a new mechanism: `identity_hash`
+    /// is already person-stable (derived from the verified document, not
+    /// this device's keypair — see `buildBallot`'s doc comment), and
+    /// ShywareLLC/core's `api/server/router.go` `updateBallot` has always
+    /// supported looking up `old_submission_id` itself via its reconcile
+    /// store given `scoping_id` + `identity_hash` alone; nothing server-side
+    /// needed to change to make this reachable, only a client willing to
+    /// call it.
+    ///
+    /// Returns `nil` — not an error — specifically when the server reports
+    /// no matching receipt (its "no receipt found for this voter on poll"
+    /// 404): that means this identity has genuinely never voted on this
+    /// poll from any device, not that recovery failed. Any other failure
+    /// (network, a real server error, an unapproved Didit session) propagates
+    /// normally. Callers should fall through to a normal `castBallot` on a
+    /// `nil` result — see `castOrRecoverBallot` below, which does exactly
+    /// that using the same per-poll keypair.
+    public func updateBallotReconciled(
+        pollId: String,
+        newChoices: [String],
+        diditSessionId: String
+    ) async throws -> BallotResult? {
+        let nonce = randomHex(32)
+        let ballotId = sha256hex(nonce)
+
+        // Same per-poll keypair castBallot/updateBallot already use —
+        // deterministic per (device, pollId), so a subsequent cast-fallback
+        // call (if this returns nil) reuses the identical key and the
+        // enclave sees the same (session_id, poll_id, voter_pub_key) triple
+        // on both calls — its own replay guard treats that as an idempotent
+        // retry, not a conflict (see idv-enclave/server.js's `/attest`
+        // handler: "Same request retried ... idempotent, not an attack").
+        let voterKey = try voterKeyStore.keypair(forPollId: pollId)
+        let voterPubKeyHex = voterKey.publicKey.rawRepresentation
+            .map { String(format: "%02x", $0) }.joined()
+        let deviceMessage = Data(("update:" + nonce + ":" + pollId).utf8)
+        let voterSig = try voterKey.signature(for: deviceMessage)
+
+        guard let enclaveClient else {
+            throw ShywareError.invalidManifest(
+                "identity.attestation_service_base_url is not configured, but reconciled recovery requires a fresh enclave attestation"
+            )
+        }
+        let attestation = try await enclaveClient.attest(
+            sessionId: diditSessionId,
+            voterPubKeyHex: voterPubKeyHex,
+            pollId: pollId
+        )
+
+        let beacon = try await fetchBeacon()
+
+        // Flat, unwrapped body — router.go's reconciled branch decodes this
+        // directly into {identity_hash} + tx.BallotUpdateData, then fills
+        // old_submission_id itself and builds/broadcasts the real envelope
+        // server-side. This device never learns (and doesn't need) the
+        // original cast's ballot_id — that's the entire point of this path.
+        let body: [String: Any] = [
+            "identity_hash": attestation.identityHash,
+            "scoping_id": pollId,
+            "new_submission_nonce": nonce,
+            "beacon_block_hash": beacon.hash,
+            "beacon_block_height": beacon.height,
+            "new_choices": newChoices,
+            "timestamp": Int(Date().timeIntervalSince1970),
+            "voter_pub_key": voterPubKeyHex,
+            "voter_sig": voterSig.base64EncodedString(),
+            "idv_attestation_sig": attestation.signature.base64EncodedString(),
+            "didit_session_id": diditSessionId,
+        ]
+
+        do {
+            try await post("/ballots/update", body: body)
+        } catch let error as ShywareError where error.statusCode == 404 {
+            return nil
+        }
+
+        let result = BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: attestation.identityHash, txJson: "")
+        if !newChoices.isEmpty, !effectivePosture().writeOnly {
+            try? receiptStore.save(BallotReceipt(
+                pollId: pollId,
+                ballotId: result.ballotId,
+                ballotNonce: result.ballotNonce,
+                choice: newChoices[0],
+                identityHash: result.identityHash
+            ))
+        }
+        return result
+    }
+
+    /// Casts a new ballot — unless this participant already has a vote
+    /// registered on this poll from a different device/install with no
+    /// local receipt here, in which case this recovers and updates that
+    /// existing vote instead of hitting the chain's duplicate-vote
+    /// rejection. See `updateBallotReconciled`'s doc comment for the
+    /// recovery mechanism; this just sequences it ahead of a normal cast,
+    /// sharing one per-poll keypair across both attempts.
+    @discardableResult
+    public func castOrRecoverBallot(
+        pollId: String,
+        choice: String,
+        input: IdentityInput,
+        diditSessionId: String
+    ) async throws -> BallotResult {
+        if let recovered = try await updateBallotReconciled(pollId: pollId, newChoices: [choice], diditSessionId: diditSessionId) {
+            return recovered
+        }
+        return try await castBallot(pollId: pollId, choice: choice, input: input, diditSessionId: diditSessionId)
+    }
+
     // MARK: - Verify
 
     public func verifyReceipt(nonce: String, expectedChoice: String, votes: [VoteRecord]) -> ReceiptVerification {
