@@ -138,6 +138,47 @@ public actor EnclaveAttestationClient {
         }
         return (sigBytes, decoded.identityHash)
     }
+
+    /// Calls `POST /recovery/enroll` with an Approved Didit session_id (the
+    /// original KYC session, or any other Approved session for this
+    /// account) and returns the enclave's wrapping key `k`, raw bytes.
+    /// Idempotent server-side: a retry (same person, already enrolled)
+    /// returns the SAME k rather than minting a new one -- see
+    /// idv-enclave/server.js's /recovery/enroll doc comment.
+    public func enrollRecoveryKey(sessionId: String) async throws -> Data {
+        try await recoveryKeyRequest(path: "/recovery/enroll", sessionId: sessionId)
+    }
+
+    /// Calls `POST /recovery/release` with a Didit
+    /// workflow_type=BIOMETRIC_AUTHENTICATION session_id (face scan only,
+    /// matched against this person's original enrollment portrait -- no
+    /// document resubmission) and returns the SAME wrapping key `k`
+    /// enrollRecoveryKey minted earlier, raw bytes. Throws if this account
+    /// was never enrolled (404) or the biometric check didn't pass (403).
+    public func releaseRecoveryKey(sessionId: String) async throws -> Data {
+        try await recoveryKeyRequest(path: "/recovery/release", sessionId: sessionId)
+    }
+
+    private func recoveryKeyRequest(path: String, sessionId: String) async throws -> Data {
+        guard let url = URL(string: baseURL + path) else {
+            throw EnclaveAttestationError.invalidURL
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["session_id": sessionId])
+
+        let (data, response) = try await session.data(for: req)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw EnclaveAttestationError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        }
+        struct RecoveryKeyResponse: Decodable { let k_hex: String }
+        let decoded = try JSONDecoder().decode(RecoveryKeyResponse.self, from: data)
+        guard let kBytes = Data(hexString: decoded.k_hex) else {
+            throw EnclaveAttestationError.invalidSignatureHex
+        }
+        return kBytes
+    }
 }
 
 /// Pins TLS connections to one configured host to the public key of one
