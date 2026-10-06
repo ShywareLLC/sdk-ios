@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!--
+  Hosts cmd/zk-prover-wasm (the GOOS=js GOARCH=wasm build) inside a real
+  WKWebView/WebView JS engine -- JavaScriptCore (iOS) / V8 (Android), both
+  real JIT compilers Apple/Google's own sandboxed browser code is permitted
+  to run, unlike the pure-interpreter WasmKit/WASI path this replaced after
+  a Groth16 Prove() call measured 3000x+ slower there (confirmed 2026-10-05;
+  see cmd/zk-prover-wasi/main.go's doc comment for the full finding).
+
+  Loaded via WKWebView.loadFileURL (iOS) or WebView.loadUrl("file:///android_asset/...")
+  (Android) from app-bundled resources -- never fetched over the network.
+  person_secret never leaves this page; only the native host's
+  evaluateJavaScript calls cross the native/JS boundary, and only with
+  values the native caller explicitly supplies or the JS side computes
+  locally from them.
+-->
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script src="wasm_exec.js"></script>
+<script>
+  // readyPromise resolves once shywareZKReady is set (zk-prover-wasm's own
+  // signal, polled the same way zkpClient.js already does) -- native hosts
+  // should await this (via evaluateJavaScript's completion handler polling,
+  // or by only issuing calls after it resolves) before calling any
+  // shywareZK* function, same as the Node test harness this was validated
+  // against.
+  window.shywareReadyPromise = (async () => {
+    const go = new Go();
+    const resp = await fetch("zk-prover.wasm");
+    const bytes = await resp.arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(bytes, go.importObject);
+    go.run(instance); // never resolves by design (select{} in Go) -- do not await this call itself
+    while (!window.shywareZKReady) {
+      await new Promise(r => setTimeout(r, 10));
+    }
+    return true;
+  })();
+</script>
+</body>
+</html>
