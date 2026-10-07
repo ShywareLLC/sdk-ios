@@ -447,11 +447,14 @@ public struct VotesResponse: Codable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        if let votes = try values.decodeIfPresent([VoteRecord].self, forKey: .votes) {
+        let value = try decoder.singleValueContainer()
+        if let votes = try? value.decode([String: VoteRecord].self) {
+            self.votes = Array(votes.values)
+        } else if let votes = try? value.decode([VoteRecord].self) {
             self.votes = votes
-            return
+        } else {
+            let wrapped = try decoder.container(keyedBy: CodingKeys.self)
+            self.votes = try wrapped.decode([VoteRecord].self, forKey: .votes)
         }
-        self.votes = [try VoteRecord(from: decoder)]
     }
 }

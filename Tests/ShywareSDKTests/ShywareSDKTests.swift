@@ -137,8 +137,120 @@ final class ShywareSDKTests: XCTestCase {
         XCTAssertTrue(config.deployment.runtimeFallbacks.writeOnlyOnUntrustedDeviceAttestation)
     }
 
+    func testUnsignedVotingManifestIsValid() throws {
+        let config = makeManifest(signingRequired: false, signingBackend: "none")
+        XCTAssertNoThrow(try assertVotingManifest(config))
+    }
+
+    func testReceiptVerificationMatchesCanonicalBeaconDerivedID() async throws {
+        let client = try VotingClient.from(makeManifest(signingRequired: false, signingBackend: "none"))
+        let beacon = String(repeating: "11", count: 32)
+        let nonce = String(repeating: "22", count: 32)
+        let expected = "5189c77d29fe5d546a045ec46986852785fea5c13ac7da9c115ff5fb6edf817c"
+        XCTAssertEqual(deriveSubmissionIdHex(beaconBlockHash: beacon, nonceHex: nonce), expected)
+        let votes = try JSONDecoder().decode([VoteRecord].self,
+            from: Data("[{\"ballot_id\":\"\(expected)\",\"choices\":[\"yes\"]}]".utf8))
+        let valid = await client.verifyReceipt(nonce: nonce, expectedChoice: "yes", votes: votes, beaconBlockHash: beacon)
+        XCTAssertTrue(valid.verified)
+        let wrongChoice = await client.verifyReceipt(nonce: nonce, expectedChoice: "no", votes: votes, beaconBlockHash: beacon)
+        XCTAssertFalse(wrongChoice.verified)
+        let missingBeacon = await client.verifyReceipt(nonce: nonce, expectedChoice: "yes", votes: votes)
+        XCTAssertFalse(missingBeacon.verified)
+    }
+
+    func testReceiptAndVoterKeysAreIsolatedByAccount() {
+        XCTAssertNotEqual(KeychainReceiptStore(appId: "test", storageScope: "alice").service,
+                          KeychainReceiptStore(appId: "test", storageScope: "bob").service)
+        XCTAssertNotEqual(KeychainVoterKeyStore(appId: "test", storageScope: "alice").service,
+                          KeychainVoterKeyStore(appId: "test", storageScope: "bob").service)
+    }
+
+    func testCanonicalVotesDictionaryDecodes() throws {
+        let json = "{\"abc\":{\"ballot_id\":\"abc\",\"choices\":[\"yes\"]}}"
+        let response = try JSONDecoder().decode(VotesResponse.self, from: Data(json.utf8))
+        XCTAssertEqual(response.votes.count, 1)
+        XCTAssertEqual(response.votes[0].ballotId, "abc")
+        XCTAssertEqual(response.votes[0].choices, ["yes"])
+        let empty = try JSONDecoder().decode(VotesResponse.self, from: Data("{}".utf8))
+        XCTAssertTrue(empty.votes.isEmpty)
+    }
+
+    func testWriteOnlyCastAndUpdateKeepReceiptOnlyInMemory() async throws {
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.protocolClasses = [VotingTestURLProtocol.self]
+        let session = URLSession(configuration: sessionConfig)
+        let scope = UUID().uuidString
+        let config = makeManifest(signingRequired: false, signingBackend: "none", writeOnlyOnUntrustedDeviceAttestation: true)
+        let client = try VotingClient.from(config, storageScope: scope, session: session)
+        VotingTestURLProtocol.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-Shyware-Posture"), "write_only")
+            if request.url?.path == "/health" {
+                return Data("{\"result\":{\"sync_info\":{\"latest_block_hash\":\"\(String(repeating: "11", count: 32))\",\"latest_block_height\":\"1\"}}}".utf8)
+            }
+            return Data("{\"queued\":true}".utf8)
+        }
+        defer { session.invalidateAndCancel(); VotingTestURLProtocol.handler = nil }
+        let result = try await client.castBallot(pollId: "poll-1", choice: "yes", input: .didit(personId: "alice"))
+        let receipt = try await client.loadReceipt(pollId: "poll-1")
+        XCTAssertEqual(receipt?.ballotId, result.ballotId)
+        XCTAssertNil(try KeychainReceiptStore(appId: config.app.id, storageScope: scope).load(pollId: "poll-1"))
+        XCTAssertNil(try KeychainVoterKeyStore(appId: config.app.id, storageScope: scope).existingKey(forPollId: "poll-1"))
+        _ = try await client.updateBallot(pollId: "poll-1", newChoices: ["no"])
+        let updated = try await client.loadReceipt(pollId: "poll-1")
+        XCTAssertEqual(updated?.choice, "no")
+        XCTAssertNil(try KeychainReceiptStore(appId: config.app.id, storageScope: scope).load(pollId: "poll-1"))
+        await client.clearSession()
+        let cleared = try await client.loadReceipt(pollId: "poll-1")
+        XCTAssertNil(cleared)
+    }
+
+    func testOperatorCannotMakeHostileNetworkRecoverable() async throws {
+        var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(makeManifest(signingRequired: false, signingBackend: "none"))) as! [String: Any]
+        var deployment = json["deployment"] as! [String: Any]
+        deployment["posture_endpoint"] = "/posture"
+        var fallbacks = deployment["runtime_fallbacks"] as! [String: Any]
+        fallbacks["write_only_on_hostile_network"] = true
+        deployment["runtime_fallbacks"] = fallbacks
+        json["deployment"] = deployment
+        let config = try JSONDecoder().decode(ShyConfig.self, from: JSONSerialization.data(withJSONObject: json))
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.protocolClasses = [VotingTestURLProtocol.self]
+        let session = URLSession(configuration: sessionConfig)
+        VotingTestURLProtocol.handler = { _ in Data("{\"posture\":\"recoverable\",\"source\":\"operator\"}".utf8) }
+        defer { session.invalidateAndCancel(); VotingTestURLProtocol.handler = nil }
+        let client = try VotingClient.from(config, session: session)
+        await client.setRuntimeSignals(RuntimeSignals(network: .init(hostile: true)))
+        await client.fetchOperatorPosture()
+        let posture = await client.effectivePosture()
+        XCTAssertTrue(posture.writeOnly)
+        XCTAssertTrue(posture.fallbackReasons.contains("hostile_network"))
+    }
+
+    func testRejectedCastDoesNotCreateReceipt() async throws {
+        let config = makeManifest(signingRequired: false, signingBackend: "none", defaultPosture: "write_only")
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.protocolClasses = [VotingTestURLProtocol.self]
+        let session = URLSession(configuration: sessionConfig)
+        VotingTestURLProtocol.handler = { request in
+            if request.url?.path == "/health" {
+                return Data("{\"result\":{\"sync_info\":{\"latest_block_hash\":\"\(String(repeating: "11", count: 32))\",\"latest_block_height\":\"1\"}}}".utf8)
+            }
+            return Data("{\"result\":{\"check_tx\":{\"code\":0},\"tx_result\":{\"code\":1}}}".utf8)
+        }
+        defer { session.invalidateAndCancel(); VotingTestURLProtocol.handler = nil }
+        let client = try VotingClient.from(config, session: session)
+        do {
+            _ = try await client.castBallot(pollId: "rejected", choice: "yes", input: .didit(personId: "alice"))
+            XCTFail("Rejected ballot appeared submitted")
+        } catch ShywareError.apiError {}
+        let receipt = try await client.loadReceipt(pollId: "rejected")
+        XCTAssertNil(receipt)
+    }
+
     private func makeManifest(
         provider: String = "didit",
+        signingRequired: Bool = true,
+        signingBackend: String = "managed_hsm",
         defaultPosture: String = "recoverable",
         writeOnlyOnUntrustedDeviceAttestation: Bool = false
     ) -> ShyConfig {
@@ -160,8 +272,8 @@ final class ShywareSDKTests: XCTestCase {
             "kyc_required": true
           },
           "signing": {
-            "required": true,
-            "backend": "managed_hsm"
+            "required": \(signingRequired),
+            "backend": "\(signingBackend)"
           },
           "anon_layer": {
             "black_box_required": true,
@@ -191,4 +303,20 @@ final class ShywareSDKTests: XCTestCase {
             from: Data(json.utf8)
         )
     }
+}
+
+private final class VotingTestURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> Data)?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        do {
+            let data = try Self.handler!(request)
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+    override func stopLoading() {}
 }

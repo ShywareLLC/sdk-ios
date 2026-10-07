@@ -35,8 +35,9 @@ public struct BallotReceipt: Codable, Sendable {
 public class KeychainReceiptStore {
     let service: String
 
-    public init(appId: String) {
-        self.service = "com.comission.shyware.\(appId).receipts"
+    public init(appId: String, storageScope: String? = nil) {
+        let scope = storageScope.map { "." + sha256hex($0) } ?? ""
+        self.service = "com.comission.shyware.\(appId).receipts\(scope)"
     }
 
     public func save(_ receipt: BallotReceipt) throws {
@@ -112,8 +113,9 @@ public class KeychainReceiptStore {
 public class KeychainVoterKeyStore {
     let service: String
 
-    public init(appId: String) {
-        self.service = "com.comission.shyware.\(appId).voterkeys"
+    public init(appId: String, storageScope: String? = nil) {
+        let scope = storageScope.map { "." + sha256hex($0) } ?? ""
+        self.service = "com.comission.shyware.\(appId).voterkeys\(scope)"
     }
 
     /// Returns the existing per-poll keypair if one was already generated
@@ -121,7 +123,7 @@ public class KeychainVoterKeyStore {
     /// Callers should always go through this rather than constructing their
     /// own Curve25519.Signing.PrivateKey() directly for a per-poll ballot.
     public func keypair(forPollId pollId: String) throws -> Curve25519.Signing.PrivateKey {
-        if let existing = try load(pollId: pollId) {
+        if let existing = try existingKey(forPollId: pollId) {
             return existing
         }
         let fresh = Curve25519.Signing.PrivateKey()
@@ -145,7 +147,7 @@ public class KeychainVoterKeyStore {
         }
     }
 
-    private func load(pollId: String) throws -> Curve25519.Signing.PrivateKey? {
+    public func existingKey(forPollId pollId: String) throws -> Curve25519.Signing.PrivateKey? {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,

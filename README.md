@@ -1,7 +1,7 @@
 # ShywareSDK — iOS
 
 Swift Package for the iOS Shyware client SDK.  
-Platforms: macOS 13+, iOS 16+ · Swift 5.9+
+Platforms: macOS 14+, iOS 17+ · Swift 5.9+
 
 Also ships `DPIAHelpers`, the Swift proof/evidence helper target used by Stack 5 DPIA suites.
 
@@ -14,7 +14,7 @@ Also ships `DPIAHelpers`, the Swift proof/evidence helper target used by Stack 5
 Add to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.1.0")
+.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.2.0")
 ```
 
 Or in Xcode: **File → Add Packages**, enter `https://github.com/ShywareLLC/sdk-ios.git`.
@@ -69,7 +69,7 @@ let config = ShyConfig(
     app: AppConfig(id: "your-app-id"),
     api: APIConfig(baseURL: "https://vote.yourdomain.com"),
     identity: IdentityConfig(provider: "didit", mode: "stable_person_id"),
-    signing: SigningConfig(required: true, backend: "aws_kms"),
+    signing: SigningConfig(required: false, backend: "none"),
     anonLayer: AnonLayerConfig(blackBoxRequired: true,
         requiredFlows: ["poll_read", "ballot_build", "ballot_submit", "receipt_verify"]),
     receipts: ReceiptsConfig(),

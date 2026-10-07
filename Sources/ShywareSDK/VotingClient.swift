@@ -14,6 +14,14 @@ public struct BallotResult: Sendable {
     /// SHA-256(nonce) alone, so the beacon used for THIS submission has to
     /// be persisted alongside the nonce. See deriveSubmissionIdHex.
     public let beaconBlockHash: String
+    public init(ballotId: String, ballotNonce: String, identityHash: String, txJson: String, beaconBlockHash: String) {
+        self.ballotId = ballotId
+        self.ballotNonce = ballotNonce
+        self.identityHash = identityHash
+        self.txJson = txJson
+        self.beaconBlockHash = beaconBlockHash
+    }
+
 }
 
 public struct ReceiptVerification: Sendable {
@@ -38,9 +46,6 @@ public func assertVotingManifest(_ config: ShyConfig) throws {
     }
     guard config.identity.provider != "none" else {
         throw ShywareError.invalidManifest("A real identity provider is required")
-    }
-    guard config.signing.required, config.signing.backend != "none" else {
-        throw ShywareError.invalidManifest("Signing must be required and enabled")
     }
 }
 
@@ -85,6 +90,8 @@ public actor VotingClient {
     private let assertionProvider: ShyAssertionProvider?
     private let firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?
     private let enclaveClient: EnclaveAttestationClient?
+    private var sessionReceipts: [String: BallotReceipt] = [:]
+    private var sessionVoterKeys: [String: Curve25519.Signing.PrivateKey] = [:]
 
     /// Operator-pushed posture. Fetched from `deployment.posture_endpoint` on init.
     /// Wins over user preference, runtime fallbacks, and manifest default.
@@ -126,18 +133,20 @@ public actor VotingClient {
     public static func from(
         _ shyconfig: ShyConfig,
         assertionProvider: ShyAssertionProvider? = nil,
-        firebaseIDTokenProvider: ShyFirebaseIDTokenProvider? = nil
+        firebaseIDTokenProvider: ShyFirebaseIDTokenProvider? = nil,
+        storageScope: String? = nil,
+        session: URLSession = .shared
     ) throws -> VotingClient {
         try assertVotingManifest(shyconfig)
-        return VotingClient(manifest: shyconfig, assertionProvider: assertionProvider, firebaseIDTokenProvider: firebaseIDTokenProvider)
+        return VotingClient(manifest: shyconfig, assertionProvider: assertionProvider, firebaseIDTokenProvider: firebaseIDTokenProvider, storageScope: storageScope, session: session)
     }
 
-    private init(manifest: ShyConfig, assertionProvider: ShyAssertionProvider?, firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?) {
+    private init(manifest: ShyConfig, assertionProvider: ShyAssertionProvider?, firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?, storageScope: String?, session: URLSession) {
         self.manifest = manifest
         self.signals = .untrusted
-        self.receiptStore = KeychainReceiptStore(appId: manifest.app.id)
-        self.voterKeyStore = KeychainVoterKeyStore(appId: manifest.app.id)
-        self.session = URLSession.shared
+        self.receiptStore = KeychainReceiptStore(appId: manifest.app.id, storageScope: storageScope)
+        self.voterKeyStore = KeychainVoterKeyStore(appId: manifest.app.id, storageScope: storageScope)
+        self.session = session
         self.assertionProvider = assertionProvider
         self.firebaseIDTokenProvider = firebaseIDTokenProvider
         // Deployment-specific: each Shyware consumer configures its own
@@ -186,7 +195,7 @@ public actor VotingClient {
     }
 
     /// Resolves posture with full precedence stack:
-    ///   operator override > user preference > runtime fallbacks > manifest default
+    ///   runtime safety fallbacks > operator override > user preference > manifest default
     public func effectivePosture() -> PostureResult {
         // Start from manifest + runtime signals
         var result = resolveEffectivePosture(manifest: manifest, signals: signals)
@@ -210,8 +219,8 @@ public actor VotingClient {
             )
         }
 
-        // Operator override wins unconditionally
-        if let op = operatorPosture {
+        // Operators may restrict retention, but cannot relax active safety fallbacks.
+        if let op = operatorPosture, !signalFallbackActive || op == "write_only" {
             result = PostureResult(
                 configuredPosture: result.configuredPosture,
                 effectivePosture: op,
@@ -221,6 +230,12 @@ public actor VotingClient {
         }
 
         return result
+    }
+
+    /// Erases the caller's off-chain recovery index and encrypted recovery secret.
+    /// This requires server-verified Firebase authentication and leaves canonical records intact.
+    public func deleteRecoveryData() async throws {
+        let _: [String: Bool] = try await post("/recovery/delete", body: [String: String]())
     }
 
     // MARK: - Read
@@ -243,6 +258,12 @@ public actor VotingClient {
 
     public func getTally(_ id: String) async throws -> Tally {
         return try await get("/polls/\(id)/tally")
+    }
+
+    public func getVoterCount(_ id: String) async throws -> Int64 {
+        struct Response: Decodable { let count: Int64 }
+        let response: Response = try await get("/polls/\(id)/voters")
+        return response.count
     }
 
     public func getVotes(_ id: String) async throws -> [VoteRecord] {
@@ -319,7 +340,7 @@ public actor VotingClient {
         // on the very first failed attempt, regardless of whether the
         // ballot itself ever reached canonical state. Confirmed live
         // 2026-10-03: this was happening on every single poll tested.
-        let voterKey = try voterKeyStore.keypair(forPollId: pollId)
+        let voterKey = try voterKey(for: pollId)
         let voterPubKeyHex = voterKey.publicKey.rawRepresentation
             .map { String(format: "%02x", $0) }.joined()
         let deviceMessage = Data((nonce + ":" + pollId).utf8)
@@ -413,7 +434,7 @@ public actor VotingClient {
     ) async throws -> BallotResult {
         let nonce = randomHex(32)
 
-        let voterKey = try voterKeyStore.keypair(forPollId: pollId)
+        let voterKey = try voterKey(for: pollId)
         let voterPubKeyHex = voterKey.publicKey.rawRepresentation
             .map { String(format: "%02x", $0) }.joined()
         let deviceMessage = Data(("update:" + nonce + ":" + pollId).utf8)
@@ -493,8 +514,7 @@ public actor VotingClient {
         let result = try await buildBallot(pollId: pollId, choice: choice, input: input, diditSessionId: diditSessionId)
         try await submitBallot(txJson: result.txJson)
 
-        let posture = effectivePosture()
-        if !posture.writeOnly {
+        do {
             let receipt = BallotReceipt(
                 pollId: pollId,
                 ballotId: result.ballotId,
@@ -503,7 +523,7 @@ public actor VotingClient {
                 identityHash: result.identityHash,
                 beaconBlockHash: result.beaconBlockHash
             )
-            try? receiptStore.save(receipt)
+            remember(receipt)
         }
         return result
     }
@@ -521,7 +541,7 @@ public actor VotingClient {
         newChoices: [String],
         diditSessionId: String? = nil
     ) async throws -> BallotResult {
-        guard let receipt = try receiptStore.load(pollId: pollId) else {
+        guard let receipt = try loadReceipt(pollId: pollId) else {
             throw ShywareError.invalidInput("No existing receipt for poll \(pollId) — cannot update a ballot that was never cast on this device")
         }
         let result = try await buildBallotUpdate(
@@ -533,6 +553,7 @@ public actor VotingClient {
         try await post("/ballots/update", body: ["tx": result.txJson])
 
         if newChoices.isEmpty {
+            sessionReceipts.removeValue(forKey: pollId)
             receiptStore.delete(pollId: pollId)
         } else {
             let newReceipt = BallotReceipt(
@@ -543,7 +564,7 @@ public actor VotingClient {
                 identityHash: result.identityHash,
                 beaconBlockHash: result.beaconBlockHash
             )
-            try? receiptStore.save(newReceipt)
+            remember(newReceipt)
         }
         return result
     }
@@ -592,7 +613,7 @@ public actor VotingClient {
         // on both calls — its own replay guard treats that as an idempotent
         // retry, not a conflict (see idv-enclave/server.js's `/attest`
         // handler: "Same request retried ... idempotent, not an attack").
-        let voterKey = try voterKeyStore.keypair(forPollId: pollId)
+        let voterKey = try voterKey(for: pollId)
         let voterPubKeyHex = voterKey.publicKey.rawRepresentation
             .map { String(format: "%02x", $0) }.joined()
         let deviceMessage = Data(("update:" + nonce + ":" + pollId).utf8)
@@ -640,8 +661,8 @@ public actor VotingClient {
         }
 
         let result = BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: attestation.identityHash, txJson: "", beaconBlockHash: beacon.hash)
-        if !newChoices.isEmpty, !effectivePosture().writeOnly {
-            try? receiptStore.save(BallotReceipt(
+        if !newChoices.isEmpty {
+            remember(BallotReceipt(
                 pollId: pollId,
                 ballotId: result.ballotId,
                 ballotNonce: result.ballotNonce,
@@ -667,6 +688,9 @@ public actor VotingClient {
         input: IdentityInput,
         diditSessionId: String
     ) async throws -> BallotResult {
+        if effectivePosture().writeOnly {
+            return try await castBallot(pollId: pollId, choice: choice, input: input, diditSessionId: diditSessionId)
+        }
         if let recovered = try await updateBallotReconciled(pollId: pollId, newChoices: [choice], diditSessionId: diditSessionId) {
             return recovered
         }
@@ -675,8 +699,10 @@ public actor VotingClient {
 
     // MARK: - Verify
 
-    public func verifyReceipt(nonce: String, expectedChoice: String, votes: [VoteRecord]) -> ReceiptVerification {
-        let ballotId = sha256hex(nonce)
+    public func verifyReceipt(nonce: String, expectedChoice: String, votes: [VoteRecord], beaconBlockHash: String? = nil) -> ReceiptVerification {
+        guard let beaconBlockHash, let ballotId = deriveSubmissionIdHex(beaconBlockHash: beaconBlockHash, nonceHex: nonce) else {
+            return ReceiptVerification(verified: false, ballotId: "", matchedChoice: nil)
+        }
         let match = votes.first { $0.ballotId == ballotId && $0.choices.contains(expectedChoice) }
         return ReceiptVerification(
             verified: match != nil,
@@ -686,7 +712,35 @@ public actor VotingClient {
     }
 
     public func loadReceipt(pollId: String) throws -> BallotReceipt? {
-        try receiptStore.load(pollId: pollId)
+        if let receipt = sessionReceipts[pollId] { return receipt }
+        guard !effectivePosture().writeOnly else { return nil }
+        let receipt = try receiptStore.load(pollId: pollId)
+        // Legacy receipts without a beacon cannot identify a canonical ballot.
+        return receipt?.beaconBlockHash == nil ? nil : receipt
+    }
+
+    public func clearSession(deletePersisted: Bool = false) {
+        sessionReceipts.removeAll()
+        sessionVoterKeys.removeAll()
+        if deletePersisted {
+            receiptStore.deleteAll()
+            voterKeyStore.deleteAll()
+            UserDefaults.standard.removeObject(forKey: userPostureKey)
+        }
+    }
+
+    private func remember(_ receipt: BallotReceipt) {
+        sessionReceipts[receipt.pollId] = receipt
+        if !effectivePosture().writeOnly { try? receiptStore.save(receipt) }
+    }
+
+    private func voterKey(for pollId: String) throws -> Curve25519.Signing.PrivateKey {
+        if !effectivePosture().writeOnly { return try voterKeyStore.keypair(forPollId: pollId) }
+        if let key = sessionVoterKeys[pollId] { return key }
+        // Reuse an existing key to preserve enclave retry authorization, without a new write.
+        let key = try voterKeyStore.existingKey(forPollId: pollId) ?? Curve25519.Signing.PrivateKey()
+        sessionVoterKeys[pollId] = key
+        return key
     }
 
     // MARK: - HTTP
@@ -735,8 +789,20 @@ public actor VotingClient {
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         req.httpBody = bodyData
         try await injectAuth(&req, requestData: bodyData)
-        let (_, response) = try await session.data(for: req)
+        let (data, response) = try await session.data(for: req)
         try validate(response: response)
+        if path == "/ballots" || path == "/ballots/update" {
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw ShywareError.apiError("Invalid ballot submission response")
+            }
+            if let error = json["error"] { throw ShywareError.apiError("Ballot submission rejected: \(error)") }
+            if json["queued"] as? Bool == true { return }
+            guard let result = json["result"] as? [String: Any],
+                  let check = result["check_tx"] as? [String: Any], let applied = result["tx_result"] as? [String: Any],
+                  check["code"] as? Int == 0, applied["code"] as? Int == 0 else {
+                throw ShywareError.apiError("The ledger did not accept this ballot")
+            }
+        }
     }
 
     /// Injects authentication into a request based on api.auth_scheme.
@@ -759,12 +825,13 @@ public actor VotingClient {
     /// regardless of `api.auth_scheme`. See the doc comment on
     /// `firebaseIDTokenProvider` in `from(_:assertionProvider:firebaseIDTokenProvider:)`.
     private func injectAuth(_ req: inout URLRequest, requestData: Data) async throws {
+        if effectivePosture().writeOnly { req.setValue("write_only", forHTTPHeaderField: "X-Shyware-Posture") }
         if manifest.api.requiresAuth, manifest.api.authScheme == "app_attest", let provider = assertionProvider,
            let token = try? await provider(requestData) {
             req.setValue(String(decoding: token, as: UTF8.self), forHTTPHeaderField: "X-Attest-Token")
             req.setValue("ios", forHTTPHeaderField: "X-Attest-Platform")
         }
-        if let firebaseIDTokenProvider, let idToken = try? await firebaseIDTokenProvider() {
+        if let firebaseIDTokenProvider, let idToken = try await firebaseIDTokenProvider() {
             req.setValue("Bearer \(idToken)", forHTTPHeaderField: "Authorization")
         }
     }
