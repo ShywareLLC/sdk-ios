@@ -66,3 +66,21 @@ func sha256hex(_ input: String) -> String {
     let digest = SHA256.hash(data: data)
     return digest.map { String(format: "%02x", $0) }.joined()
 }
+
+/// Matches ShywareLLC/core's protocol/submission/nonce.go DeriveSubmissionID
+/// EXACTLY: submission_id = SHA-256(beacon_block_hash_bytes || nonce_bytes),
+/// raw byte concatenation after hex-decoding each input, not sha256hex's
+/// UTF-8-string-bytes hashing above (a different computation entirely).
+/// Found live 2026-10-07 -- VotingClient's ballotId used sha256hex(nonce)
+/// alone, omitting the beacon, so the device-computed ballotId never
+/// matched the chain's real on-chain submission_id for any ballot that
+/// actually fetched a live beacon (which every real cast does). Confirmed
+/// against the Go core directly, not assumed -- see OPS.md's 2026-10-07 entry.
+func deriveSubmissionIdHex(beaconBlockHash: String, nonceHex: String) -> String? {
+    guard let beaconBytes = Data(hexString: beaconBlockHash),
+          let nonceBytes = Data(hexString: nonceHex) else {
+        return nil
+    }
+    let digest = SHA256.hash(data: beaconBytes + nonceBytes)
+    return digest.map { String(format: "%02x", $0) }.joined()
+}

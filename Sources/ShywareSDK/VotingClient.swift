@@ -9,6 +9,11 @@ public struct BallotResult: Sendable {
     public let ballotNonce: String
     public let identityHash: String
     public let txJson: String
+    /// Required to ever recompute ballotId again (verifyReceipt, or a future
+    /// buildBallotUpdate call) -- ballotId is SHA-256(beacon||nonce), not
+    /// SHA-256(nonce) alone, so the beacon used for THIS submission has to
+    /// be persisted alongside the nonce. See deriveSubmissionIdHex.
+    public let beaconBlockHash: String
 }
 
 public struct ReceiptVerification: Sendable {
@@ -304,7 +309,6 @@ public actor VotingClient {
         diditSessionId: String? = nil
     ) async throws -> BallotResult {
         let nonce = randomHex(32)
-        let ballotId = sha256hex(nonce)
 
         // Per-poll Ed25519 keypair -- persisted in the Keychain and reused
         // across calls for the same pollId, not regenerated fresh every
@@ -330,6 +334,9 @@ public actor VotingClient {
         var identityHash = ""
 
         let beacon = try await fetchBeacon()
+        guard let ballotId = deriveSubmissionIdHex(beaconBlockHash: beacon.hash, nonceHex: nonce) else {
+            throw ShywareError.invalidManifest("Could not derive ballotId from beacon.hash/nonce hex")
+        }
 
         var data: [String: Any] = [
             "scoping_id": pollId,
@@ -378,7 +385,7 @@ public actor VotingClient {
         let txData = try JSONSerialization.data(withJSONObject: envelope)
         let txJson = String(decoding: txData, as: UTF8.self)
 
-        return BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: identityHash, txJson: txJson)
+        return BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: identityHash, txJson: txJson, beaconBlockHash: beacon.hash)
     }
 
     // MARK: - Build (update)
@@ -405,7 +412,6 @@ public actor VotingClient {
         diditSessionId: String? = nil
     ) async throws -> BallotResult {
         let nonce = randomHex(32)
-        let ballotId = sha256hex(nonce)
 
         let voterKey = try voterKeyStore.keypair(forPollId: pollId)
         let voterPubKeyHex = voterKey.publicKey.rawRepresentation
@@ -416,6 +422,9 @@ public actor VotingClient {
         // identity_hash is enclave-attested -- see buildBallot's identical comment above.
         var identityHash = ""
         let beacon = try await fetchBeacon()
+        guard let ballotId = deriveSubmissionIdHex(beaconBlockHash: beacon.hash, nonceHex: nonce) else {
+            throw ShywareError.invalidManifest("Could not derive ballotId from beacon.hash/nonce hex")
+        }
 
         var data: [String: Any] = [
             "scoping_id": pollId,
@@ -456,7 +465,7 @@ public actor VotingClient {
         let txData = try JSONSerialization.data(withJSONObject: envelope)
         let txJson = String(decoding: txData, as: UTF8.self)
 
-        return BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: identityHash, txJson: txJson)
+        return BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: identityHash, txJson: txJson, beaconBlockHash: beacon.hash)
     }
 
     // MARK: - Submit
@@ -491,7 +500,8 @@ public actor VotingClient {
                 ballotId: result.ballotId,
                 ballotNonce: result.ballotNonce,
                 choice: choice,
-                identityHash: result.identityHash
+                identityHash: result.identityHash,
+                beaconBlockHash: result.beaconBlockHash
             )
             try? receiptStore.save(receipt)
         }
@@ -530,7 +540,8 @@ public actor VotingClient {
                 ballotId: result.ballotId,
                 ballotNonce: result.ballotNonce,
                 choice: newChoices[0],
-                identityHash: result.identityHash
+                identityHash: result.identityHash,
+                beaconBlockHash: result.beaconBlockHash
             )
             try? receiptStore.save(newReceipt)
         }
@@ -573,7 +584,6 @@ public actor VotingClient {
         diditSessionId: String
     ) async throws -> BallotResult? {
         let nonce = randomHex(32)
-        let ballotId = sha256hex(nonce)
 
         // Same per-poll keypair castBallot/updateBallot already use —
         // deterministic per (device, pollId), so a subsequent cast-fallback
@@ -600,6 +610,9 @@ public actor VotingClient {
         )
 
         let beacon = try await fetchBeacon()
+        guard let ballotId = deriveSubmissionIdHex(beaconBlockHash: beacon.hash, nonceHex: nonce) else {
+            throw ShywareError.invalidManifest("Could not derive ballotId from beacon.hash/nonce hex")
+        }
 
         // Flat, unwrapped body — router.go's reconciled branch decodes this
         // directly into {identity_hash} + tx.BallotUpdateData, then fills
@@ -626,14 +639,15 @@ public actor VotingClient {
             return nil
         }
 
-        let result = BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: attestation.identityHash, txJson: "")
+        let result = BallotResult(ballotId: ballotId, ballotNonce: nonce, identityHash: attestation.identityHash, txJson: "", beaconBlockHash: beacon.hash)
         if !newChoices.isEmpty, !effectivePosture().writeOnly {
             try? receiptStore.save(BallotReceipt(
                 pollId: pollId,
                 ballotId: result.ballotId,
                 ballotNonce: result.ballotNonce,
                 choice: newChoices[0],
-                identityHash: result.identityHash
+                identityHash: result.identityHash,
+                beaconBlockHash: result.beaconBlockHash
             ))
         }
         return result

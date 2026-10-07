@@ -9,15 +9,24 @@ public struct BallotReceipt: Codable, Sendable {
     public let choice: String
     public let identityHash: String
     public let submittedAt: Date
+    /// Required to ever recompute ballotId again (verifyReceipt, or a future
+    /// buildBallotUpdate call) -- see deriveSubmissionIdHex. Optional, not
+    /// defaulted, specifically so Codable's synthesized decoder can still
+    /// read receipts already persisted in the Keychain from before this
+    /// field existed (2026-10-07) -- those decode with beaconBlockHash: nil
+    /// rather than failing to decode at all.
+    public let beaconBlockHash: String?
 
     public init(pollId: String, ballotId: String, ballotNonce: String,
-                choice: String, identityHash: String, submittedAt: Date = Date()) {
+                choice: String, identityHash: String, submittedAt: Date = Date(),
+                beaconBlockHash: String? = nil) {
         self.pollId = pollId
         self.ballotId = ballotId
         self.ballotNonce = ballotNonce
         self.choice = choice
         self.identityHash = identityHash
         self.submittedAt = submittedAt
+        self.beaconBlockHash = beaconBlockHash
     }
 }
 
