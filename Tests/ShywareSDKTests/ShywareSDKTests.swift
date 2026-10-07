@@ -2,6 +2,29 @@ import XCTest
 @testable import ShywareSDK
 
 final class ShywareSDKTests: XCTestCase {
+    func testUnsignedDomainClientsRetainStructuralValidation() throws {
+        let cases: [(String, [String], (ShyConfig) throws -> Void)] = [
+            ("shywire-v1", ["wire_issue", "wire_transfer", "wire_redeem"], assertWireManifest),
+            ("shycontracts-v1", ["contract_register", "contract_activate", "contract_execute"], assertContractsManifest),
+            ("shycustody-v1", ["policy_read", "lot_record", "silo_transfer", "redemption_request", "redemption_settlement", "demurrage_apply"], assertCustodyManifest),
+            ("shyshares-v1", ["organization_read", "membership_snapshot_read", "proposal_create", "weighted_ballot_submit", "tally_read", "action_queue_read", "action_dispatch"], assertSharesManifest),
+            ("shybets-v1", ["event_create", "order_place", "order_book_read", "settlement_read", "settlement_finalize", "reconcile_request"], assertBetsManifest),
+        ]
+        for (contract, flows, validate) in cases {
+            var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(makeManifest(signingRequired: false, signingBackend: "none"))) as! [String: Any]
+            json["contract_version"] = contract
+            json["anon_layer"] = ["black_box_required": true, "required_flows": flows]
+            var config = try JSONDecoder().decode(ShyConfig.self, from: JSONSerialization.data(withJSONObject: json))
+            XCTAssertNoThrow(try validate(config), contract)
+            json["signing"] = ["required": false, "backend": "software"]
+            config = try JSONDecoder().decode(ShyConfig.self, from: JSONSerialization.data(withJSONObject: json))
+            XCTAssertNoThrow(try validate(config), contract)
+            json["anon_layer"] = ["black_box_required": false, "required_flows": flows]
+            config = try JSONDecoder().decode(ShyConfig.self, from: JSONSerialization.data(withJSONObject: json))
+            XCTAssertThrowsError(try validate(config), contract)
+        }
+    }
+
     func testCreateIdentityCommitmentUsesProviderSpecificSource() throws {
         let manifest = makeManifest(provider: "didit")
 
@@ -173,6 +196,35 @@ final class ShywareSDKTests: XCTestCase {
         XCTAssertEqual(response.votes[0].choices, ["yes"])
         let empty = try JSONDecoder().decode(VotesResponse.self, from: Data("{}".utf8))
         XCTAssertTrue(empty.votes.isEmpty)
+    }
+
+    func testUnknownNetworkDefaultsToHostile() async {
+        let signals = await AppAttestProvider(storageKey: UUID().uuidString).resolveSignals()
+        XCTAssertTrue(signals.network.hostile)
+    }
+
+    func testAppAttestRegistrationUsesFreshAuthentication() async throws {
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.protocolClasses = [VotingTestURLProtocol.self]
+        let session = URLSession(configuration: sessionConfig)
+        defer { session.invalidateAndCancel(); VotingTestURLProtocol.handler = nil }
+        let url = URL(string: "https://example.test/attest/register")!
+        var requests = 0
+        VotingTestURLProtocol.handler = { request in
+            requests += 1
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fresh-token")
+            return Data("{}".utf8)
+        }
+        let provider = AppAttestProvider(registrationURL: url, registrationTokenProvider: { "fresh-token" }, session: session)
+        try await provider.registerWithBackend(keyId: "key", attestation: Data([1]), challenge: Data([2]), url: url)
+        XCTAssertEqual(requests, 1)
+        let signedOut = AppAttestProvider(registrationURL: url, registrationTokenProvider: { nil }, session: session)
+        do {
+            try await signedOut.registerWithBackend(keyId: "key", attestation: Data([1]), challenge: Data([2]), url: url)
+            XCTFail("Registration proceeded without configured authentication")
+        } catch { }
+        XCTAssertEqual(requests, 1)
     }
 
     func testWriteOnlyCastAndUpdateKeepReceiptOnlyInMemory() async throws {

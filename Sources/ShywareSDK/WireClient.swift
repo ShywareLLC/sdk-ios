@@ -236,9 +236,6 @@ public func assertWireManifest(_ config: ShyConfig) throws {
     for flow in required where !config.anonLayer.requiredFlows.contains(flow) {
         throw ShywareError.invalidManifest("Missing required wire flow: \(flow)")
     }
-    guard config.signing.required, config.signing.backend != "none" else {
-        throw ShywareError.invalidManifest("Signing must be required and enabled")
-    }
 }
 
 // MARK: - WireClient

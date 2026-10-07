@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 (prepared; not published)
+
+- Authenticate App Attest registration with an injected fresh token provider; reject missing configured authentication.
+- Default unassessed App Attest network signals to hostile.
+- Extend optional signing support to wire, custody, contracts, shares, and betting clients. Structural validation remains enforced.
+
 ## 0.2.0
 
 - Voting manifest validation accepts deployments without signing keys or KMS. Optional period-close attestations remain independent of the protocol's structural guarantees.

@@ -16,6 +16,8 @@ public class AppAttestProvider {
     private let dcService = DCAppAttestService.shared
     private let userDefaultsKey: String
     private let registrationURL: URL?
+    private let registrationTokenProvider: ShyFirebaseIDTokenProvider?
+    private let session: URLSession
 
     private(set) public var keyId: String?
 
@@ -27,10 +29,14 @@ public class AppAttestProvider {
     ///     Pass `nil` to skip backend registration (dev/test only).
     public init(
         storageKey: String = "shyware.appAttest.keyId",
-        registrationURL: URL? = nil
+        registrationURL: URL? = nil,
+        registrationTokenProvider: ShyFirebaseIDTokenProvider? = nil,
+        session: URLSession = .shared
     ) {
         self.userDefaultsKey = storageKey
         self.registrationURL = registrationURL
+        self.registrationTokenProvider = registrationTokenProvider
+        self.session = session
         self.keyId = UserDefaults.standard.string(forKey: storageKey)
     }
 
@@ -100,12 +106,11 @@ public class AppAttestProvider {
     ///   responsibility. If `network.hostile` is `true` and the shyconfig has
     ///   `write_only_on_hostile_network: true`, the client will be write-only
     ///   regardless of device attestation status. Pass `.init(hostile: false)`
-    ///   only after your app has verified the network is clean (e.g., no VPN
-    ///   active, client IP not in the deployment's `high_risk_region_blocklist`).
+    ///   only after a trusted network assessment. Unknown networks default hostile.
     ///
     /// Returns `.untrusted` on unsupported devices or attestation failure.
     public func resolveSignals(
-        network: RuntimeSignals.NetworkSignal = .init(hostile: false)
+        network: RuntimeSignals.NetworkSignal = .init(hostile: true)
     ) async -> RuntimeSignals {
         guard isSupported else {
             return RuntimeSignals(
@@ -200,17 +205,23 @@ public class AppAttestProvider {
 
     // MARK: - Private
 
-    private func registerWithBackend(keyId: String, attestation: Data, challenge: Data, url: URL) async throws {
+    func registerWithBackend(keyId: String, attestation: Data, challenge: Data, url: URL) async throws {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let registrationTokenProvider {
+            guard let token = try await registrationTokenProvider(), !token.isEmpty else {
+                throw ShywareError.apiError("Authentication is required for App Attest registration.")
+            }
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         let payload: [String: Any] = [
             "keyId": keyId,
             "attestation": attestation.base64EncodedString(),
             "challenge": challenge.base64EncodedString(),
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (_, response) = try await URLSession.shared.data(for: req)
+        let (_, response) = try await session.data(for: req)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw ShywareError.apiError("App Attest backend registration failed.")
         }

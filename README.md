@@ -14,7 +14,7 @@ Also ships `DPIAHelpers`, the Swift proof/evidence helper target used by Stack 5
 Add to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.2.0")
+.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.3.0")
 ```
 
 Or in Xcode: **File → Add Packages**, enter `https://github.com/ShywareLLC/sdk-ios.git`.
@@ -254,6 +254,14 @@ URLProtocol.unregisterClass(DevBypassURLProtocol.self)
 > to ensure the protocol intercepts correctly.
 
 ---
+
+## App Attest registration
+
+For a Firebase-authenticated relay, pass `registrationTokenProvider` to
+`AppAttestProvider` to return a fresh ID token. Missing configured authentication
+rejects registration. Unknown networks default hostile in `resolveSignals`;
+App Attest does not establish network safety. Release 0.3.0 is prepared locally
+and must be published before an external package resolver can use it.
 
 ## Manifest validation
 

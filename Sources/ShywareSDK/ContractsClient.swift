@@ -81,9 +81,6 @@ public func assertContractsManifest(_ config: ShyConfig) throws {
     guard config.anonLayer.blackBoxRequired else {
         throw ShywareError.invalidManifest("anon_layer.black_box_required must be true")
     }
-    guard config.signing.required, config.signing.backend != "none" else {
-        throw ShywareError.invalidManifest("Signing must be required and enabled")
-    }
     let required: Set<String> = ["contract_register", "contract_activate", "contract_execute"]
     for flow in required where !config.anonLayer.requiredFlows.contains(flow) {
         throw ShywareError.invalidManifest("Missing required contracts flow: \(flow)")

@@ -136,9 +136,6 @@ public func assertBetsManifest(_ config: ShyConfig) throws {
     guard config.anonLayer.blackBoxRequired else {
         throw ShywareError.invalidManifest("anon_layer.black_box_required must be true")
     }
-    guard config.signing.required, config.signing.backend != "none" else {
-        throw ShywareError.invalidManifest("Signing must be required and enabled")
-    }
     let required: Set<String> = [
         "event_create", "order_place", "order_book_read",
         "settlement_read", "settlement_finalize", "reconcile_request"

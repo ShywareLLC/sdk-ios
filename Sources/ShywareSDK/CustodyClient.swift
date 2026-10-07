@@ -90,9 +90,6 @@ public func assertCustodyManifest(_ config: ShyConfig) throws {
     guard config.anonLayer.blackBoxRequired else {
         throw ShywareError.invalidManifest("anon_layer.black_box_required must be true")
     }
-    guard config.signing.required, config.signing.backend != "none" else {
-        throw ShywareError.invalidManifest("Signing must be required and enabled")
-    }
     let required: Set<String> = [
         "policy_read", "lot_record", "silo_transfer",
         "redemption_request", "redemption_settlement", "demurrage_apply"
