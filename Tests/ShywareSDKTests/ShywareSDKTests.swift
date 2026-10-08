@@ -177,8 +177,15 @@ final class ShywareSDKTests: XCTestCase {
         XCTAssertTrue(valid.verified)
         let wrongChoice = await client.verifyReceipt(nonce: nonce, expectedChoice: "no", votes: votes, beaconBlockHash: beacon)
         XCTAssertFalse(wrongChoice.verified)
-        let missingBeacon = await client.verifyReceipt(nonce: nonce, expectedChoice: "yes", votes: votes)
+        let missingBeacon = await client.verifyReceipt(nonce: nonce, expectedChoice: "yes", votes: votes, beaconBlockHash: "")
         XCTAssertFalse(missingBeacon.verified)
+    }
+
+    func testReceiptsRequireOriginalBeacon() throws {
+        let receipt = BallotReceipt(pollId: "poll", ballotId: "id", ballotNonce: "nonce", choice: "yes", identityHash: "identity", beaconBlockHash: String(repeating: "11", count: 32))
+        var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(receipt)) as! [String: Any]
+        json.removeValue(forKey: "beaconBlockHash")
+        XCTAssertThrowsError(try JSONDecoder().decode(BallotReceipt.self, from: JSONSerialization.data(withJSONObject: json)))
     }
 
     func testReceiptAndVoterKeysAreIsolatedByAccount() {

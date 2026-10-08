@@ -2,6 +2,7 @@
 
 ## 0.3.0 (prepared; not published)
 
+- Require the original beacon in every receipt and verification call; unsupported receipt formats are rejected.
 - Authenticate App Attest registration with an injected fresh token provider; reject missing configured authentication.
 - Default unassessed App Attest network signals to hostile.
 - Extend optional signing support to wire, custody, contracts, shares, and betting clients. Structural validation remains enforced.

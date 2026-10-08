@@ -699,8 +699,8 @@ public actor VotingClient {
 
     // MARK: - Verify
 
-    public func verifyReceipt(nonce: String, expectedChoice: String, votes: [VoteRecord], beaconBlockHash: String? = nil) -> ReceiptVerification {
-        guard let beaconBlockHash, let ballotId = deriveSubmissionIdHex(beaconBlockHash: beaconBlockHash, nonceHex: nonce) else {
+    public func verifyReceipt(nonce: String, expectedChoice: String, votes: [VoteRecord], beaconBlockHash: String) -> ReceiptVerification {
+        guard let ballotId = deriveSubmissionIdHex(beaconBlockHash: beaconBlockHash, nonceHex: nonce) else {
             return ReceiptVerification(verified: false, ballotId: "", matchedChoice: nil)
         }
         let match = votes.first { $0.ballotId == ballotId && $0.choices.contains(expectedChoice) }
@@ -714,9 +714,7 @@ public actor VotingClient {
     public func loadReceipt(pollId: String) throws -> BallotReceipt? {
         if let receipt = sessionReceipts[pollId] { return receipt }
         guard !effectivePosture().writeOnly else { return nil }
-        let receipt = try receiptStore.load(pollId: pollId)
-        // Legacy receipts without a beacon cannot identify a canonical ballot.
-        return receipt?.beaconBlockHash == nil ? nil : receipt
+        return try receiptStore.load(pollId: pollId)
     }
 
     public func clearSession(deletePersisted: Bool = false) {
