@@ -254,6 +254,8 @@ public struct ReceiptsConfig: Codable, Sendable {
 }
 
 public struct DeploymentConfig: Codable, Sendable {
+    public let submissionDispatch: String?
+    public let coverTrafficRate: Double?
     public let defaultPosture: String
     public let runtimeFallbacks: RuntimeFallbacks
     /// Optional endpoint the client GETs to receive an operator-pushed posture override.
@@ -262,18 +264,24 @@ public struct DeploymentConfig: Codable, Sendable {
     /// Whether users are permitted to override posture locally (privacy mode toggle).
     public let allowUserPostureOverride: Bool
     enum CodingKeys: String, CodingKey {
+        case submissionDispatch = "submission_dispatch"
+        case coverTrafficRate = "cover_traffic_rate"
         case defaultPosture = "default_posture"
         case runtimeFallbacks = "runtime_fallbacks"
         case postureEndpoint = "posture_endpoint"
         case allowUserPostureOverride = "allow_user_posture_override"
     }
     public init(defaultPosture: String = "recoverable", runtimeFallbacks: RuntimeFallbacks = .none(),
-                postureEndpoint: String? = nil, allowUserPostureOverride: Bool = false) {
+                postureEndpoint: String? = nil, allowUserPostureOverride: Bool = false,
+                submissionDispatch: String? = nil, coverTrafficRate: Double? = nil) {
+        self.submissionDispatch = submissionDispatch; self.coverTrafficRate = coverTrafficRate
         self.defaultPosture = defaultPosture; self.runtimeFallbacks = runtimeFallbacks
         self.postureEndpoint = postureEndpoint; self.allowUserPostureOverride = allowUserPostureOverride
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        submissionDispatch = try c.decodeIfPresent(String.self, forKey: .submissionDispatch)
+        coverTrafficRate = try c.decodeIfPresent(Double.self, forKey: .coverTrafficRate)
         defaultPosture = try c.decode(String.self, forKey: .defaultPosture)
         runtimeFallbacks = try c.decode(RuntimeFallbacks.self, forKey: .runtimeFallbacks)
         postureEndpoint = try? c.decodeIfPresent(String.self, forKey: .postureEndpoint)

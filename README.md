@@ -14,7 +14,7 @@ Also ships `DPIAHelpers`, the Swift proof/evidence helper target used by Stack 5
 Add to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.3.0")
+.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.4.0")
 ```
 
 Or in Xcode: **File → Add Packages**, enter `https://github.com/ShywareLLC/sdk-ios.git`.
@@ -58,6 +58,15 @@ Each client is constructed from a `ShyConfig` manifest decoded from `shyconfig.j
 | `LotsClient` | `shylots-v1` | Sealed-bid auction lots |
 
 ---
+
+## Foreground cover transport (0.4.0)
+
+When `deployment.submission_dispatch` is `cover_traffic`, call
+`startCoverTraffic()` on authenticated foreground session entry, independently
+of voting, and `stopCoverTraffic()` on background or sign-out. Casts and updates
+then occupy fixed transport slots at `cover_traffic_rate` requests per minute.
+The relay must expose the matching `/dispatch` receiving filter. iOS background
+execution is not a promise of continuous traffic; test the shipped app on a device.
 
 ## Quick start — shyvoting
 

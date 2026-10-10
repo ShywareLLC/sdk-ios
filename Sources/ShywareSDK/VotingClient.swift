@@ -86,6 +86,7 @@ public actor VotingClient {
     private var signals: RuntimeSignals
     private let receiptStore: KeychainReceiptStore
     private let voterKeyStore: KeychainVoterKeyStore
+    private var coverTraffic: CoverTrafficAdapter?
     private let session: URLSession
     private let assertionProvider: ShyAssertionProvider?
     private let firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?
@@ -164,6 +165,46 @@ public actor VotingClient {
         } else {
             self.enclaveClient = nil
         }
+    }
+
+    /// Start on authenticated foreground session entry, independently of a vote.
+    /// Stop on background/sign-out. iOS cannot promise continuous background traffic.
+    public func startCoverTraffic() async throws {
+        guard manifest.deployment.submissionDispatch == "cover_traffic" else { return }
+        if coverTraffic == nil {
+            coverTraffic = try CoverTrafficAdapter(ratePerMinute: manifest.deployment.coverTrafficRate ?? 10) { [weak self] bytes in
+                guard let self else { throw CancellationError() }
+                return try await self.sendDispatch(bytes)
+            }
+        }
+        await coverTraffic?.start()
+    }
+
+    public func stopCoverTraffic() async {
+        await coverTraffic?.stop()
+    }
+
+    private func sendDispatch(_ bytes: Data) async throws -> Data {
+        let submitBase = manifest.api.submitBaseURL ?? manifest.api.baseURL
+        let base = submitBase.hasSuffix("/") ? String(submitBase.dropLast()) : submitBase
+        guard let url = URL(string: base + "/dispatch") else { throw ShywareError.invalidInput("Invalid dispatch URL") }
+        var req = URLRequest(url: url, timeoutInterval: 30)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = bytes
+        try await injectAuth(&req, requestData: bytes)
+        let (data, response) = try await session.data(for: req)
+        try validate(response: response)
+        guard data.count == CoverTrafficAdapter.envelopeBytes,
+              let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = result["status"] as? Int,
+              let body = result["body"] as? [String: Any] else {
+            throw ShywareError.apiError("Invalid dispatch response")
+        }
+        guard (200..<300).contains(status) else {
+            throw ShywareError.http(statusCode: status, message: body["error"] as? String ?? "Dispatch rejected")
+        }
+        return try JSONSerialization.data(withJSONObject: body)
     }
 
     // MARK: - Posture
@@ -717,7 +758,8 @@ public actor VotingClient {
         return try receiptStore.load(pollId: pollId)
     }
 
-    public func clearSession(deletePersisted: Bool = false) {
+    public func clearSession(deletePersisted: Bool = false) async {
+        await stopCoverTraffic()
         sessionReceipts.removeAll()
         sessionVoterKeys.removeAll()
         if deletePersisted {
@@ -776,19 +818,24 @@ public actor VotingClient {
     }
 
     private func post(_ path: String, body: [String: Any]) async throws {
-        let submitBase = manifest.api.submitBaseURL ?? manifest.api.baseURL
-        let base = submitBase.hasSuffix("/") ? String(submitBase.dropLast()) : submitBase
-        guard let url = URL(string: base + path) else {
-            throw ShywareError.invalidInput("Invalid URL: \(base + path)")
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let bodyData = try JSONSerialization.data(withJSONObject: body)
-        req.httpBody = bodyData
-        try await injectAuth(&req, requestData: bodyData)
-        let (data, response) = try await session.data(for: req)
-        try validate(response: response)
+        let data: Data
+        if manifest.deployment.submissionDispatch == "cover_traffic", path == "/ballots" || path == "/ballots/update" {
+            guard let coverTraffic else { throw ShywareError.apiError("Start cover traffic before submitting ballots") }
+            data = try await coverTraffic.submit(kind: path == "/ballots" ? "cast" : "update", body: bodyData)
+        } else {
+            let submitBase = manifest.api.submitBaseURL ?? manifest.api.baseURL
+            let base = submitBase.hasSuffix("/") ? String(submitBase.dropLast()) : submitBase
+            guard let url = URL(string: base + path) else { throw ShywareError.invalidInput("Invalid URL") }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = bodyData
+            try await injectAuth(&req, requestData: bodyData)
+            let (received, response) = try await session.data(for: req)
+            try validate(response: response)
+            data = received
+        }
         if path == "/ballots" || path == "/ballots/update" {
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw ShywareError.apiError("Invalid ballot submission response")
