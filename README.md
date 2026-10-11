@@ -269,8 +269,8 @@ URLProtocol.unregisterClass(DevBypassURLProtocol.self)
 For a Firebase-authenticated relay, pass `registrationTokenProvider` to
 `AppAttestProvider` to return a fresh ID token. Missing configured authentication
 rejects registration. Unknown networks default hostile in `resolveSignals`;
-App Attest does not establish network safety. Release 0.3.0 is prepared locally
-and must be published before an external package resolver can use it.
+App Attest does not establish network safety. Release 0.3.1 is published as a patch. It is the current release tag;
+superseded tags, including 0.4.0, have been removed.
 
 ## Manifest validation
 
