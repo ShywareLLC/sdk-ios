@@ -210,6 +210,31 @@ final class ShywareSDKTests: XCTestCase {
         XCTAssertTrue(signals.network.hostile)
     }
 
+    func testServerLocationAssessmentPreventsReceiptPersistence() async throws {
+        var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(makeManifest(signingRequired: false, signingBackend: "none"))) as! [String: Any]
+        var deployment = json["deployment"] as! [String: Any]
+        deployment["runtime_fallbacks"] = ["write_only_on_hostile_network": true]
+        json["deployment"] = deployment
+        let manifest = try JSONDecoder().decode(ShyConfig.self, from: JSONSerialization.data(withJSONObject: json))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [VotingTestURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let scope = UUID().uuidString
+        let client = try VotingClient.from(manifest, storageScope: scope, session: session)
+        await client.setRuntimeSignals(.trusted)
+        defer { session.invalidateAndCancel(); VotingTestURLProtocol.handler = nil }
+        VotingTestURLProtocol.handler = { request in
+            if request.url?.path == "/health" {
+                return Data("{\"result\":{\"sync_info\":{\"latest_block_hash\":\"\(String(repeating: "11", count: 32))\",\"latest_block_height\":\"1\"}}}".utf8)
+            }
+            return Data(#"{"queued":true,"location_assessed":true,"recovery_location_allowed":false}"#.utf8)
+        }
+        _ = try await client.castBallot(pollId: "poll", choice: "yes", input: .didit(personId: "alice"))
+        let posture = await client.effectivePosture()
+        XCTAssertTrue(posture.writeOnly)
+        XCTAssertNil(try KeychainReceiptStore(appId: manifest.app.id, storageScope: scope).load(pollId: "poll"))
+    }
+
     func testRecoveryCreatesAndReusesOnlyTheNewDevicePollKey() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [VotingTestURLProtocol.self]

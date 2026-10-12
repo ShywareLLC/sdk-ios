@@ -14,7 +14,7 @@ Also ships `DPIAHelpers`, the Swift proof/evidence helper target used by Stack 5
 Add to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.3.2")
+.package(url: "https://github.com/ShywareLLC/sdk-ios.git", from: "0.3.3")
 ```
 
 Or in Xcode: **File → Add Packages**, enter `https://github.com/ShywareLLC/sdk-ios.git`.
@@ -269,7 +269,7 @@ URLProtocol.unregisterClass(DevBypassURLProtocol.self)
 For a Firebase-authenticated relay, pass `registrationTokenProvider` to
 `AppAttestProvider` to return a fresh ID token. Missing configured authentication
 rejects registration. Unknown networks default hostile in `resolveSignals`;
-App Attest does not establish network safety. Release 0.3.2 adds biometric new-device recovery as a patch. It is the current release tag;
+App Attest does not establish network safety. Release 0.3.3 adds biometric new-device recovery as a patch. It is the current release tag;
 superseded tags, including 0.4.0, have been removed.
 
 ## Manifest validation
@@ -286,6 +286,8 @@ record and L2 identity record share no join key at the protocol layer.
 See `patent/mainhub/dpia/` for the full GDPR Data Protection Impact Assessment,
 per-domain evidence artifacts, and the EDPB DPIA template output.
 
-## New-device voting recovery (0.3.2)
+## New-device voting recovery (0.3.3)
 
 Call `startVoteRecovery(pollId:enrollmentSessionId:)` to create a fresh biometric session using a public key generated locally on this device. After the provider redirects back, call `setVoteRecoverySession(pollId:sessionId:)` and retry the reconciled operation. The authority verifies the real biometric result; a redirect is not authorization. The original device key is neither needed nor replaced. Recovery session references remain in memory and clear with the session. The server gates lookup on current assessed location, request-bound App Attest and dual authority approval.
+
+The fixed-size cover responses carry the relay’s current location-policy assessment. The SDK applies it before retaining a new receipt; unknown or restricted network exits force write-only behavior. This is an IP-country assessment, not proof of physical location.

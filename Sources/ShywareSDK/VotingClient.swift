@@ -202,13 +202,22 @@ public actor VotingClient {
               let body = result["body"] as? [String: Any] else {
             throw ShywareError.apiError("Invalid dispatch response")
         }
+        applyRecoveryLocation(result)
         guard (200..<300).contains(status) else {
             throw ShywareError.http(statusCode: status, message: body["error"] as? String ?? "Dispatch rejected")
         }
         return try JSONSerialization.data(withJSONObject: body)
     }
 
+    private func applyRecoveryLocation(_ response: [String: Any]) {
+        if response["location_assessed"] != nil || response["recovery_location_allowed"] != nil {
+            signals.network.hostile = !(response["location_assessed"] as? Bool == true && response["recovery_location_allowed"] as? Bool == true)
+        }
+    }
+
     // MARK: - Posture
+
+    public func currentRuntimeSignals() -> RuntimeSignals { signals }
 
     public func setRuntimeSignals(_ s: RuntimeSignals) {
         signals = s
@@ -732,7 +741,7 @@ public actor VotingClient {
         input: IdentityInput,
         diditSessionId: String
     ) async throws -> BallotResult {
-        if effectivePosture().writeOnly {
+        if manifest.deployment.defaultPosture == "coercion_resistant" || !signals.deviceAttestation.trusted || signals.network.hostile {
             return try await castBallot(pollId: pollId, choice: choice, input: input, diditSessionId: diditSessionId)
         }
         if let recovered = try await updateBallotReconciled(pollId: pollId, newChoices: [choice], diditSessionId: diditSessionId) {
@@ -854,6 +863,7 @@ public actor VotingClient {
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw ShywareError.apiError("Invalid ballot submission response")
             }
+            applyRecoveryLocation(json)
             if let error = json["error"] { throw ShywareError.apiError("Ballot submission rejected: \(error)") }
             if json["queued"] as? Bool == true { return }
             guard let result = json["result"] as? [String: Any],
