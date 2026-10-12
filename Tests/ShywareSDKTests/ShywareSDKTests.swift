@@ -210,6 +210,44 @@ final class ShywareSDKTests: XCTestCase {
         XCTAssertTrue(signals.network.hostile)
     }
 
+    func testRecoveryCreatesAndReusesOnlyTheNewDevicePollKey() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [VotingTestURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel(); VotingTestURLProtocol.handler = nil }
+        let client = try VotingClient.from(makeManifest(signingRequired: false, signingBackend: "none", writeOnlyOnUntrustedDeviceAttestation: true), storageScope: UUID().uuidString, session: session)
+        var publicKeys: [String] = []
+        VotingTestURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/recovery/vote/start")
+            var data = request.httpBody ?? Data()
+            if let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var buffer = [UInt8](repeating: 0, count: 1024)
+                while true {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    if count <= 0 { break }
+                    data.append(contentsOf: buffer.prefix(count))
+                }
+            }
+            let body = try JSONSerialization.jsonObject(with: data) as! [String: String]
+            XCTAssertEqual(body["enrollment_session_id"], "enrollment")
+            let publicKey = try XCTUnwrap(body["voter_pub_key"])
+            XCTAssertEqual(publicKey.count, 64)
+            XCTAssertNil(body["private_key"])
+            publicKeys.append(publicKey)
+            return Data(#"{"session_id":"fresh-biometric","url":"https://verify.didit.me/session"}"#.utf8)
+        }
+        let poll = UUID().uuidString
+        let first = try await client.startVoteRecovery(pollId: poll, enrollmentSessionId: "enrollment")
+        XCTAssertEqual(first.sessionId, "fresh-biometric")
+        _ = try await client.startVoteRecovery(pollId: poll, enrollmentSessionId: "enrollment")
+        XCTAssertEqual(publicKeys[0], publicKeys[1])
+        await client.clearSession()
+        _ = try await client.startVoteRecovery(pollId: poll, enrollmentSessionId: "enrollment")
+        XCTAssertNotEqual(publicKeys[0], publicKeys[2])
+    }
+
     func testAppAttestRegistrationUsesFreshAuthentication() async throws {
         let sessionConfig = URLSessionConfiguration.ephemeral
         sessionConfig.protocolClasses = [VotingTestURLProtocol.self]

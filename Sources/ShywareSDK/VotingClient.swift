@@ -91,6 +91,7 @@ public actor VotingClient {
     private let assertionProvider: ShyAssertionProvider?
     private let firebaseIDTokenProvider: ShyFirebaseIDTokenProvider?
     private let enclaveClient: EnclaveAttestationClient?
+    private var voteRecoverySessions: [String: String] = [:]
     private var sessionReceipts: [String: BallotReceipt] = [:]
     private var sessionVoterKeys: [String: Curve25519.Signing.PrivateKey] = [:]
 
@@ -681,7 +682,7 @@ public actor VotingClient {
         // old_submission_id itself and builds/broadcasts the real envelope
         // server-side. This device never learns (and doesn't need) the
         // original cast's ballot_id — that's the entire point of this path.
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "identity_hash": attestation.identityHash,
             "scoping_id": pollId,
             "new_submission_nonce": nonce,
@@ -694,6 +695,8 @@ public actor VotingClient {
             "idv_attestation_sig": attestation.signature.base64EncodedString(),
             "didit_session_id": diditSessionId,
         ]
+
+        if let recovery = voteRecoverySessions[pollId] { body["recovery_session_id"] = recovery }
 
         do {
             try await post("/ballots/update", body: body)
@@ -738,6 +741,16 @@ public actor VotingClient {
         return try await castBallot(pollId: pollId, choice: choice, input: input, diditSessionId: diditSessionId)
     }
 
+    public func startVoteRecovery(pollId: String, enrollmentSessionId: String) async throws -> VoteRecoverySession {
+        let key = try voterKey(for: pollId)
+        let publicKey = key.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        return try await post("/recovery/vote/start", body: ["scoping_id": pollId, "enrollment_session_id": enrollmentSessionId, "voter_pub_key": publicKey])
+    }
+
+    public func setVoteRecoverySession(pollId: String, sessionId: String) {
+        voteRecoverySessions[pollId] = sessionId
+    }
+
     // MARK: - Verify
 
     public func verifyReceipt(nonce: String, expectedChoice: String, votes: [VoteRecord], beaconBlockHash: String) -> ReceiptVerification {
@@ -760,6 +773,7 @@ public actor VotingClient {
 
     public func clearSession(deletePersisted: Bool = false) async {
         await stopCoverTraffic()
+        voteRecoverySessions.removeAll()
         sessionReceipts.removeAll()
         sessionVoterKeys.removeAll()
         if deletePersisted {
@@ -930,3 +944,10 @@ public enum ShywareError: Error, LocalizedError {
 }
 
 // randomHex is defined in CryptoUtils.swift (module-internal)
+
+public struct VoteRecoverySession: Decodable, Sendable, Identifiable {
+    public let sessionId: String
+    public let url: String
+    public var id: String { sessionId }
+    enum CodingKeys: String, CodingKey { case sessionId = "session_id", url }
+}
