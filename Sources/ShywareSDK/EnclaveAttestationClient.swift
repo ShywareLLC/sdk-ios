@@ -139,6 +139,32 @@ public actor EnclaveAttestationClient {
         return (sigBytes, decoded.identityHash)
     }
 
+    /// Calls `POST /vote-share/attest-key`: like `attest`, the enclave
+    /// re-checks the Didit session itself and, if it belongs to `userId`,
+    /// vouches that `pubKeyHex` (this device's vote-sharing key) is that
+    /// account's. The device then signs each vote-share grant with the key.
+    ///
+    /// - Returns: the enclave's signature (hex) over the key statement.
+    public func attestVoteShareKey(sessionId: String, userId: String, pubKeyHex: String) async throws -> String {
+        guard let url = URL(string: baseURL + "/vote-share/attest-key") else {
+            throw EnclaveAttestationError.invalidURL
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "session_id": sessionId, "user_id": userId, "pub_key": pubKeyHex,
+        ])
+        let (data, response) = try await session.data(for: req)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw EnclaveAttestationError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        }
+        struct KeyAttestation: Decodable { let key_attestation_sig: String }
+        let signature = try JSONDecoder().decode(KeyAttestation.self, from: data).key_attestation_sig
+        guard Data(hexString: signature)?.count == 64 else { throw EnclaveAttestationError.invalidSignatureHex }
+        return signature
+    }
+
     /// Calls `POST /recovery/enroll` with an Approved Didit session_id (the
     /// original KYC session, or any other Approved session for this
     /// account) and returns the enclave's wrapping key `k`, raw bytes.
