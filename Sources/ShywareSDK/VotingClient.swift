@@ -343,11 +343,17 @@ public actor VotingClient {
         guard let enclaveClient else {
             throw ShywareError.invalidInput("This deployment has no attestation service configured")
         }
-        let enrolled = try await enclaveClient.enrollDeviceSecret(sessionId: diditSessionId, userId: userId)
+        // The verification must have been started on this device: only it
+        // holds the secret whose hash the session carries.
+        guard let enrollmentSecret = EnrollmentSecretStore.secretHex(for: userId) else {
+            throw ShywareError.invalidInput("This verification wasn't started on this device; verify again here")
+        }
+        let enrolled = try await enclaveClient.enrollDeviceSecret(sessionId: diditSessionId, userId: userId, enrollmentSecretHex: enrollmentSecret)
         let record = try JSONSerialization.data(withJSONObject: [
             "device_id": enrolled.deviceId, "secret_hex": enrolled.secretHex, "identity_key_hex": enrolled.identityKeyHex,
         ])
         try voterKeyStore.saveData(record, account: "device-secret:\(userId)")
+        EnrollmentSecretStore.clear(for: userId)
     }
 
     private func deviceSecret(for userId: String) -> (deviceId: String, secretHex: String, identityKeyHex: String)? {

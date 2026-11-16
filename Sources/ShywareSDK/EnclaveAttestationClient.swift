@@ -135,9 +135,11 @@ public actor EnclaveAttestationClient {
     ///
     /// - Throws: `EnclaveAttestationError.httpError(409, …)` when the session
     ///   was already used to enroll a device.
-    public func enrollDeviceSecret(sessionId: String, userId: String) async throws -> (deviceId: String, secretHex: String, identityKeyHex: String) {
+    public func enrollDeviceSecret(sessionId: String, userId: String, enrollmentSecretHex: String) async throws -> (deviceId: String, secretHex: String, identityKeyHex: String) {
         struct Enrolled: Decodable { let device_id: String; let secret_hex: String; let identity_key_hex: String }
-        let enrolled: Enrolled = try await postJSON("/device-secret/enroll", ["session_id": sessionId, "user_id": userId])
+        let enrolled: Enrolled = try await postJSON("/device-secret/enroll", [
+            "session_id": sessionId, "user_id": userId, "enrollment_secret": enrollmentSecretHex,
+        ])
         guard Data(hexString: enrolled.secret_hex)?.count == 32, Data(hexString: enrolled.identity_key_hex)?.count == 32 else {
             throw EnclaveAttestationError.invalidSignatureHex
         }
@@ -185,8 +187,8 @@ public actor EnclaveAttestationClient {
     /// Idempotent server-side: a retry (same person, already enrolled)
     /// returns the SAME k rather than minting a new one -- see
     /// idv-enclave/server.js's /recovery/enroll doc comment.
-    public func enrollRecoveryKey(sessionId: String) async throws -> Data {
-        try await recoveryKeyRequest(path: "/recovery/enroll", sessionId: sessionId)
+    public func enrollRecoveryKey(sessionId: String, enrollmentSecretHex: String) async throws -> Data {
+        try await recoveryKeyRequest(path: "/recovery/enroll", sessionId: sessionId, enrollmentSecretHex: enrollmentSecretHex)
     }
 
     /// Calls `POST /recovery/release` with a Didit
@@ -199,14 +201,16 @@ public actor EnclaveAttestationClient {
         try await recoveryKeyRequest(path: "/recovery/release", sessionId: sessionId)
     }
 
-    private func recoveryKeyRequest(path: String, sessionId: String) async throws -> Data {
+    private func recoveryKeyRequest(path: String, sessionId: String, enrollmentSecretHex: String? = nil) async throws -> Data {
         guard let url = URL(string: baseURL + path) else {
             throw EnclaveAttestationError.invalidURL
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["session_id": sessionId])
+        var body = ["session_id": sessionId]
+        if let enrollmentSecretHex { body["enrollment_secret"] = enrollmentSecretHex }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: req)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
