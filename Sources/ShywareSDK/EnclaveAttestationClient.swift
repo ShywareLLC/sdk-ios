@@ -139,30 +139,53 @@ public actor EnclaveAttestationClient {
         return (sigBytes, decoded.identityHash)
     }
 
-    /// Calls `POST /vote-share/attest-key`: like `attest`, the enclave
-    /// re-checks the Didit session itself and, if it belongs to `userId`,
-    /// vouches that `pubKeyHex` (this device's vote-sharing key) is that
-    /// account's. The device then signs each vote-share grant with the key.
+    /// Calls `POST /device-secret/enroll` right after the person's Didit
+    /// verification is Approved. The enclave re-checks the session, consumes
+    /// it for good (a session id is useless to anyone afterwards), and returns
+    /// a secret only this device and the enclave hold.
+    ///
+    /// - Throws: `EnclaveAttestationError.httpError(409, …)` when the session
+    ///   was already used to enroll a device.
+    public func enrollDeviceSecret(sessionId: String, userId: String) async throws -> (deviceId: String, secretHex: String) {
+        struct Enrolled: Decodable { let device_id: String; let secret_hex: String }
+        let enrolled: Enrolled = try await postJSON("/device-secret/enroll", ["session_id": sessionId, "user_id": userId])
+        guard Data(hexString: enrolled.secret_hex)?.count == 32 else { throw EnclaveAttestationError.invalidSignatureHex }
+        return (enrolled.device_id, enrolled.secret_hex)
+    }
+
+    /// Calls `POST /vote-share/attest-key`: the device proves it holds its
+    /// enrolled secret (an HMAC over account, device, key and time) and the
+    /// enclave vouches that `pubKeyHex` (this device's vote-sharing key) is
+    /// that account's. The device then signs each vote-share grant with it.
     ///
     /// - Returns: the enclave's signature (hex) over the key statement.
-    public func attestVoteShareKey(sessionId: String, userId: String, pubKeyHex: String) async throws -> String {
-        guard let url = URL(string: baseURL + "/vote-share/attest-key") else {
+    public func attestVoteShareKey(userId: String, deviceId: String, secretHex: String, pubKeyHex: String) async throws -> String {
+        guard let secret = Data(hexString: secretHex) else { throw EnclaveAttestationError.invalidSignatureHex }
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let message = ["shyware-vote-share-key-request-v1", userId, deviceId, pubKeyHex, timestamp].joined(separator: "\n")
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: secret))
+            .map { String(format: "%02x", $0) }.joined()
+        struct KeyAttestation: Decodable { let key_attestation_sig: String }
+        let signature: KeyAttestation = try await postJSON("/vote-share/attest-key", [
+            "user_id": userId, "device_id": deviceId, "pub_key": pubKeyHex, "timestamp": timestamp, "mac": mac,
+        ])
+        guard Data(hexString: signature.key_attestation_sig)?.count == 64 else { throw EnclaveAttestationError.invalidSignatureHex }
+        return signature.key_attestation_sig
+    }
+
+    private func postJSON<T: Decodable>(_ path: String, _ body: [String: String]) async throws -> T {
+        guard let url = URL(string: baseURL + path) else {
             throw EnclaveAttestationError.invalidURL
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
-            "session_id": sessionId, "user_id": userId, "pub_key": pubKeyHex,
-        ])
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: req)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw EnclaveAttestationError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
         }
-        struct KeyAttestation: Decodable { let key_attestation_sig: String }
-        let signature = try JSONDecoder().decode(KeyAttestation.self, from: data).key_attestation_sig
-        guard Data(hexString: signature)?.count == 64 else { throw EnclaveAttestationError.invalidSignatureHex }
-        return signature
+        return try JSONDecoder().decode(T.self, from: data)
     }
 
     /// Calls `POST /recovery/enroll` with an Approved Didit session_id (the

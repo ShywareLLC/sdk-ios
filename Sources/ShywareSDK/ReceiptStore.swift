@@ -158,6 +158,33 @@ public class KeychainVoterKeyStore {
         return try Curve25519.Signing.PrivateKey(rawRepresentation: data)
     }
 
+    /// Raw bytes kept under this store's service (device-bound, this device only).
+    func saveData(_ data: Data, account: String) throws {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecValueData: data,
+            kSecAttrAccessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        SecItemDelete(query as CFDictionary)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw VoterKeyStoreError.keychainFailure(status) }
+    }
+
+    func data(account: String) -> Data? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
     /// Deletes all per-poll voter keys for this deployment. Called during
     /// privacy wipe, same as KeychainReceiptStore.deleteAll().
     public func deleteAll() {

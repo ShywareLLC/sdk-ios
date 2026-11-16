@@ -305,13 +305,17 @@ public actor VotingClient {
     /// the Keychain, never sent anywhere) and the enclave, after re-checking
     /// the Didit session, vouches that the key is `grantorUid`'s. The returned
     /// fields go to the reconciling authority, which checks both signatures.
-    public func signVoteShareGrant(grantorUid: String, granteeUid: String, diditSessionId: String) async throws -> [String: Any] {
+    public func signVoteShareGrant(grantorUid: String, granteeUid: String) async throws -> [String: Any] {
         guard let enclaveClient else {
             throw ShywareError.invalidInput("This deployment has no attestation service configured")
         }
+        guard let device = deviceSecret(for: grantorUid) else {
+            throw ShywareError.invalidInput("This device isn't enrolled; verify your identity on it first")
+        }
         let key = try voterKeyStore.keypair(forPollId: "vote-share-grants")
         let pubHex = key.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
-        let keyAttestation = try await enclaveClient.attestVoteShareKey(sessionId: diditSessionId, userId: grantorUid, pubKeyHex: pubHex)
+        let keyAttestation = try await enclaveClient.attestVoteShareKey(
+            userId: grantorUid, deviceId: device.deviceId, secretHex: device.secretHex, pubKeyHex: pubHex)
         let grant: [String: Any] = [
             "v": 1, "grant_id": UUID().uuidString.lowercased(), "purpose": "vote_share", "scope": "all_votes",
             "grantor_uid": grantorUid, "grantee_uid": granteeUid,
@@ -324,6 +328,31 @@ public actor VotingClient {
             "grantor_pub_key": pubHex,
             "key_attestation_sig": keyAttestation,
         ]
+    }
+
+    /// Whether this device holds an enrolled secret for `userId`.
+    public func hasDeviceSecret(for userId: String) -> Bool { deviceSecret(for: userId) != nil }
+
+    /// Enrolls this device with the enclave right after the person's Didit
+    /// verification is Approved: the session is consumed and a secret comes
+    /// back, kept in this device's Keychain. Does nothing if already enrolled.
+    /// Throws `EnclaveAttestationError.httpError(409, …)` if the session was
+    /// already used, which means another party enrolled with it first.
+    public func enrollDeviceSecretIfNeeded(userId: String, diditSessionId: String) async throws {
+        guard deviceSecret(for: userId) == nil else { return }
+        guard let enclaveClient else {
+            throw ShywareError.invalidInput("This deployment has no attestation service configured")
+        }
+        let enrolled = try await enclaveClient.enrollDeviceSecret(sessionId: diditSessionId, userId: userId)
+        let record = try JSONSerialization.data(withJSONObject: ["device_id": enrolled.deviceId, "secret_hex": enrolled.secretHex])
+        try voterKeyStore.saveData(record, account: "device-secret:\(userId)")
+    }
+
+    private func deviceSecret(for userId: String) -> (deviceId: String, secretHex: String)? {
+        guard let data = voterKeyStore.data(account: "device-secret:\(userId)"),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              let deviceId = object["device_id"], let secretHex = object["secret_hex"] else { return nil }
+        return (deviceId, secretHex)
     }
 
     /// The bytes the device signs; must match the reconciling authority's
