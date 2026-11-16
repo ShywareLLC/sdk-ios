@@ -344,15 +344,42 @@ public actor VotingClient {
             throw ShywareError.invalidInput("This deployment has no attestation service configured")
         }
         let enrolled = try await enclaveClient.enrollDeviceSecret(sessionId: diditSessionId, userId: userId)
-        let record = try JSONSerialization.data(withJSONObject: ["device_id": enrolled.deviceId, "secret_hex": enrolled.secretHex])
+        let record = try JSONSerialization.data(withJSONObject: [
+            "device_id": enrolled.deviceId, "secret_hex": enrolled.secretHex, "identity_key_hex": enrolled.identityKeyHex,
+        ])
         try voterKeyStore.saveData(record, account: "device-secret:\(userId)")
     }
 
-    private func deviceSecret(for userId: String) -> (deviceId: String, secretHex: String)? {
+    private func deviceSecret(for userId: String) -> (deviceId: String, secretHex: String, identityKeyHex: String)? {
         guard let data = voterKeyStore.data(account: "device-secret:\(userId)"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-              let deviceId = object["device_id"], let secretHex = object["secret_hex"] else { return nil }
-        return (deviceId, secretHex)
+              let deviceId = object["device_id"], let secretHex = object["secret_hex"],
+              let identityKeyHex = object["identity_key_hex"] else { return nil }   // older records re-enroll
+        return (deviceId, secretHex, identityKeyHex)
+    }
+
+    /// The account whose enrolled device attests ballot keys (set by the app
+    /// once it knows who is signed in).
+    private var attestingUserId: String?
+    public func setAttestingUser(_ userId: String?) { attestingUserId = userId }
+
+    /// The enclave's statement for this poll's ballot key, proven by this
+    /// device's enrolled secret -- never a Didit session id. `diditSessionId`
+    /// is used only to enroll the device first if it hasn't been. nil when no
+    /// account is attesting (the ballot then carries no IDV attestation).
+    private func attestBallotKey(pollId: String, voterPubKeyHex: String, diditSessionId: String?) async throws -> (signature: Data, identityHash: String)? {
+        guard let userId = attestingUserId else { return nil }
+        guard let enclaveClient else {
+            throw ShywareError.invalidManifest("identity.attestation_service_base_url is not configured")
+        }
+        if deviceSecret(for: userId) == nil, let diditSessionId, !diditSessionId.isEmpty {
+            try await enrollDeviceSecretIfNeeded(userId: userId, diditSessionId: diditSessionId)
+        }
+        guard let device = deviceSecret(for: userId) else {
+            throw ShywareError.invalidInput("This device isn't enrolled; verify your identity on it first")
+        }
+        return try await enclaveClient.attest(userId: userId, deviceId: device.deviceId, secretHex: device.secretHex,
+                                              identityKeyHex: device.identityKeyHex, voterPubKeyHex: voterPubKeyHex, pollId: pollId)
     }
 
     /// The bytes the device signs; must match the reconciling authority's
@@ -501,19 +528,9 @@ public actor VotingClient {
         // `input` is accepted for interface stability but not otherwise used —
         // the enclave, not this device, is the party attesting the keypair.
         _ = input
-        if let diditSessionId, !diditSessionId.isEmpty {
-            guard let enclaveClient else {
-                throw ShywareError.invalidManifest(
-                    "identity.attestation_service_base_url is not configured, but a Didit session_id was provided to buildBallot"
-                )
-            }
-            let attestation = try await enclaveClient.attest(
-                sessionId: diditSessionId,
-                voterPubKeyHex: voterPubKeyHex,
-                pollId: pollId
-            )
+        // No didit_session_id on the ballot: it would be public on the ledger.
+        if let attestation = try await attestBallotKey(pollId: pollId, voterPubKeyHex: voterPubKeyHex, diditSessionId: diditSessionId) {
             data["idv_attestation_sig"] = attestation.signature.base64EncodedString()
-            data["didit_session_id"] = diditSessionId
             data["identity_hash"] = attestation.identityHash
             identityHash = attestation.identityHash
         }
@@ -581,19 +598,8 @@ public actor VotingClient {
         // enclave's replay guard is idempotent for the same (session_id,
         // poll_id, voter_pub_key) triple, so reusing the cast-time session
         // id here (when still on hand) works with no enclave changes.
-        if let diditSessionId, !diditSessionId.isEmpty {
-            guard let enclaveClient else {
-                throw ShywareError.invalidManifest(
-                    "identity.attestation_service_base_url is not configured, but a Didit session_id was provided to buildBallotUpdate"
-                )
-            }
-            let attestation = try await enclaveClient.attest(
-                sessionId: diditSessionId,
-                voterPubKeyHex: voterPubKeyHex,
-                pollId: pollId
-            )
+        if let attestation = try await attestBallotKey(pollId: pollId, voterPubKeyHex: voterPubKeyHex, diditSessionId: diditSessionId) {
             data["idv_attestation_sig"] = attestation.signature.base64EncodedString()
-            data["didit_session_id"] = diditSessionId
             data["identity_hash"] = attestation.identityHash
             identityHash = attestation.identityHash
         }
@@ -735,16 +741,9 @@ public actor VotingClient {
         let deviceMessage = Data(("update:" + nonce + ":" + pollId).utf8)
         let voterSig = try voterKey.signature(for: deviceMessage)
 
-        guard let enclaveClient else {
-            throw ShywareError.invalidManifest(
-                "identity.attestation_service_base_url is not configured, but reconciled recovery requires a fresh enclave attestation"
-            )
+        guard let attestation = try await attestBallotKey(pollId: pollId, voterPubKeyHex: voterPubKeyHex, diditSessionId: diditSessionId) else {
+            throw ShywareError.invalidInput("Reconciled recovery needs an attesting account")
         }
-        let attestation = try await enclaveClient.attest(
-            sessionId: diditSessionId,
-            voterPubKeyHex: voterPubKeyHex,
-            pollId: pollId
-        )
 
         let beacon = try await fetchBeacon()
         guard let ballotId = deriveSubmissionIdHex(beaconBlockHash: beacon.hash, nonceHex: nonce) else {
@@ -767,10 +766,14 @@ public actor VotingClient {
             "voter_pub_key": voterPubKeyHex,
             "voter_sig": voterSig.base64EncodedString(),
             "idv_attestation_sig": attestation.signature.base64EncodedString(),
-            "didit_session_id": diditSessionId,
         ]
 
-        if let recovery = voteRecoverySessions[pollId] { body["recovery_session_id"] = recovery }
+        // The relay forwards the enrollment session to the enclave only for
+        // face-scan recovery; it never reaches the ledger. Not sent otherwise.
+        if let recovery = voteRecoverySessions[pollId] {
+            body["recovery_session_id"] = recovery
+            body["didit_session_id"] = diditSessionId
+        }
 
         do {
             try await post("/ballots/update", body: body)

@@ -102,37 +102,26 @@ public actor EnclaveAttestationClient {
         self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
     }
 
-    /// Requests an IDV attestation signature for `voterPubKeyHex` over `pollId`,
-    /// backed by the Didit verification session `sessionId`. The enclave
-    /// independently re-checks the session against Didit's real session-status
-    /// API before signing — it does not trust this call's claim that the
-    /// session is verified.
+    /// Requests the enclave's statement for a per-poll ballot key (`POST /attest`).
+    /// No Didit session id is sent: the device proves it holds its enrolled
+    /// secret (an HMAC over account, device, key, poll and time) and presents
+    /// its identity key, which unlocks the verified document reference the
+    /// enclave stored encrypted at enrollment. The enclave computes the same
+    /// `identity_hash` as before and signs what the chain verifies.
     ///
-    /// - Returns: the raw Ed25519 signature bytes (decoded from the enclave's
-    ///   hex response), ready to be base64-encoded into the outgoing
-    ///   `idv_attestation_sig` transaction field, and the enclave's
-    ///   `identity_hash` (hex) — required on the same transaction's
-    ///   `identity_hash` field. The chain verifies the signature covers it;
-    ///   it never recomputes identity_hash itself.
-    public func attest(sessionId: String, voterPubKeyHex: String, pollId: String) async throws -> (signature: Data, identityHash: String) {
-        guard let url = URL(string: baseURL + "/attest") else {
-            throw EnclaveAttestationError.invalidURL
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: String] = [
-            "session_id": sessionId,
-            "voter_pub_key": voterPubKeyHex,
-            "poll_id": pollId,
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, response) = try await session.data(for: req)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw EnclaveAttestationError.httpError(statusCode: http.statusCode, body: String(decoding: data, as: UTF8.self))
-        }
-        let decoded = try JSONDecoder().decode(EnclaveAttestationResponse.self, from: data)
+    /// - Returns: the raw Ed25519 signature bytes for `idv_attestation_sig`,
+    ///   and the enclave's `identity_hash` (hex) for the same transaction.
+    public func attest(userId: String, deviceId: String, secretHex: String, identityKeyHex: String,
+                       voterPubKeyHex: String, pollId: String) async throws -> (signature: Data, identityHash: String) {
+        guard let secret = Data(hexString: secretHex) else { throw EnclaveAttestationError.invalidSignatureHex }
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let message = ["shyware-ballot-key-request-v1", userId, deviceId, voterPubKeyHex, pollId, timestamp].joined(separator: "\n")
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: secret))
+            .map { String(format: "%02x", $0) }.joined()
+        let decoded: EnclaveAttestationResponse = try await postJSON("/attest", [
+            "user_id": userId, "device_id": deviceId, "voter_pub_key": voterPubKeyHex, "poll_id": pollId,
+            "timestamp": timestamp, "mac": mac, "identity_key": identityKeyHex,
+        ])
         guard let sigBytes = Data(hexString: decoded.idvAttestationSigHex) else {
             throw EnclaveAttestationError.invalidSignatureHex
         }
@@ -146,11 +135,13 @@ public actor EnclaveAttestationClient {
     ///
     /// - Throws: `EnclaveAttestationError.httpError(409, …)` when the session
     ///   was already used to enroll a device.
-    public func enrollDeviceSecret(sessionId: String, userId: String) async throws -> (deviceId: String, secretHex: String) {
-        struct Enrolled: Decodable { let device_id: String; let secret_hex: String }
+    public func enrollDeviceSecret(sessionId: String, userId: String) async throws -> (deviceId: String, secretHex: String, identityKeyHex: String) {
+        struct Enrolled: Decodable { let device_id: String; let secret_hex: String; let identity_key_hex: String }
         let enrolled: Enrolled = try await postJSON("/device-secret/enroll", ["session_id": sessionId, "user_id": userId])
-        guard Data(hexString: enrolled.secret_hex)?.count == 32 else { throw EnclaveAttestationError.invalidSignatureHex }
-        return (enrolled.device_id, enrolled.secret_hex)
+        guard Data(hexString: enrolled.secret_hex)?.count == 32, Data(hexString: enrolled.identity_key_hex)?.count == 32 else {
+            throw EnclaveAttestationError.invalidSignatureHex
+        }
+        return (enrolled.device_id, enrolled.secret_hex, enrolled.identity_key_hex)
     }
 
     /// Calls `POST /vote-share/attest-key`: the device proves it holds its
