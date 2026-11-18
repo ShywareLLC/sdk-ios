@@ -364,6 +364,16 @@ public actor VotingClient {
         return (deviceId, secretHex, identityKeyHex)
     }
 
+    /// An "I voted" stamp for `pollId`: proof, signed by the IDV enclave, that
+    /// this account was counted, naming neither the account nor its ballot
+    /// (a ballot ID would show the choice). nil when this device isn't
+    /// enrolled for `userId` or the account has no counted vote in the poll.
+    public func participationStamp(pollId: String, userId: String) async throws -> String? {
+        guard let enclaveClient, let device = deviceSecret(for: userId) else { return nil }
+        return try await enclaveClient.participationStamp(userId: userId, deviceId: device.deviceId, secretHex: device.secretHex,
+                                                          identityKeyHex: device.identityKeyHex, pollId: pollId)
+    }
+
     /// The account whose enrolled device attests ballot keys (set by the app
     /// once it knows who is signed in).
     private var attestingUserId: String?

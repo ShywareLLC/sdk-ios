@@ -128,6 +128,31 @@ public actor EnclaveAttestationClient {
         return (sigBytes, decoded.identityHash)
     }
 
+    /// Requests an "I voted" stamp (`POST /participation-stamp`): the enclave
+    /// checks, from the ledger, that this account's poll participant entry is
+    /// counted, then signs a statement with a fresh nonce that names neither
+    /// the participant nor the ballot. Proven like `attest` (HMAC with the
+    /// enrolled secret, plus the identity key). Returns nil when this account
+    /// has no counted vote in the poll.
+    public func participationStamp(userId: String, deviceId: String, secretHex: String, identityKeyHex: String,
+                                   pollId: String) async throws -> String? {
+        guard let secret = Data(hexString: secretHex) else { throw EnclaveAttestationError.invalidSignatureHex }
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let message = ["shyware-participation-stamp-request-v1", userId, deviceId, pollId, timestamp].joined(separator: "\n")
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: secret))
+            .map { String(format: "%02x", $0) }.joined()
+        struct Stamp: Decodable { let stamp: String }
+        do {
+            let decoded: Stamp = try await postJSON("/participation-stamp", [
+                "user_id": userId, "device_id": deviceId, "poll_id": pollId,
+                "timestamp": timestamp, "mac": mac, "identity_key": identityKeyHex,
+            ])
+            return decoded.stamp
+        } catch EnclaveAttestationError.httpError(let status, _) where status == 404 {
+            return nil
+        }
+    }
+
     /// Calls `POST /device-secret/enroll` right after the person's Didit
     /// verification is Approved. The enclave re-checks the session, consumes
     /// it for good (a session id is useless to anyone afterwards), and returns
